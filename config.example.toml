@@ -1,0 +1,23 @@
+[server]
+bind_addr = "127.0.0.1:8080"
+
+[limits]
+max_content_bytes = 65536
+
+[rules]
+path = "rules.toml"
+
+[database]
+path = "data/audit.db"
+
+[query]
+default_limit = 50
+max_limit = 500
+timeout_ms = 2000
+
+[auth]
+token_file = "secrets/api-token"
+
+[logging]
+path = "logs/classifier.log"
+level = "info"

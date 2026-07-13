@@ -10,8 +10,8 @@ Last updated: 2026-07-13
 - Specification complete and approved: `SPEC.md`, `PROTOCOL.md`.
 - `AGENTS.md` SQLite rule amended for the service-owned audit store
   (single write path).
-- Phase 0 scaffolding complete; the Cargo gate is clean. Next step: Phase 1,
-  awaiting approval.
+- Phases 0–1 are complete; the Cargo gate and Phase 1 startup verification are
+  clean. Next step: Phase 2, awaiting approval.
 - The service is non-operational throughout Phases 0–10. It must not receive
   caller traffic until every phase is complete and the user has explicitly
   approved operational readiness. Explicitly approved phase-verification runs
@@ -20,7 +20,7 @@ Last updated: 2026-07-13
 | Phase | Title                                  | Status      |
 |-------|----------------------------------------|-------------|
 | 0     | Scaffolding                            | complete    |
-| 1     | Config, secrets, logging, startup      | not started |
+| 1     | Config, secrets, logging, startup      | complete    |
 | 2     | Rules engine and shipped rules file    | not started |
 | 3     | Normalization and span map             | not started |
 | 4     | Built-in analyzers                     | not started |

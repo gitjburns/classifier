@@ -224,5 +224,13 @@ Do not perform these actions unless the user explicitly instructs you:
   `cargo update`, or dependency installation.
 - Delete files.
 
+Cargo commands are not an independent approval boundary. Once the task scope
+and every relevant effect, including file writes, are approved, agents may run
+the necessary Cargo commands without requesting separate permission. Existing
+restrictions still govern effects produced through Cargo: starting a server,
+changing dependencies, migrating data, or writing unapproved persistent state
+requires approval for that effect. Ask about the effect, never for permission
+to invoke Cargo itself.
+
 Do not use git unless the user explicitly requests a git operation. If git is
 explicitly requested, run it from the project root only and never commit secrets.
