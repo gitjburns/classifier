@@ -10,7 +10,8 @@ Last updated: 2026-07-13
 - Specification complete and approved: `SPEC.md`, `PROTOCOL.md`.
 - `AGENTS.md` SQLite rule amended for the service-owned audit store
   (single write path).
-- Implementation not started. Next step: Phase 0, awaiting approval.
+- Phase 0 scaffolding complete; the Cargo gate is clean. Next step: Phase 1,
+  awaiting approval.
 - The service is non-operational throughout Phases 0–10. It must not receive
   caller traffic until every phase is complete and the user has explicitly
   approved operational readiness. Explicitly approved phase-verification runs
@@ -18,7 +19,7 @@ Last updated: 2026-07-13
 
 | Phase | Title                                  | Status      |
 |-------|----------------------------------------|-------------|
-| 0     | Scaffolding                            | not started |
+| 0     | Scaffolding                            | complete    |
 | 1     | Config, secrets, logging, startup      | not started |
 | 2     | Rules engine and shipped rules file    | not started |
 | 3     | Normalization and span map             | not started |
@@ -118,6 +119,7 @@ Steps:
 | `time` (0.3) | Unix timestamp to RFC 3339 conversion | feature: `formatting` |
 | `unicode-normalization` (0.1) | NFKC | |
 | `unicode-script` (0.5) | script tables for `mixed-script` | |
+| `icu_properties` (2.2) | Unicode binary properties for analyzer exclusions | compiled data exposes `Extended_Pictographic` directly |
 | `tracing`, `tracing-subscriber` | service log | see Phase 1 writer decision |
 
 3. `src/main.rs` reduced to a stub `main` that exits with a "not yet
