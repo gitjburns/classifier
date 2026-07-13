@@ -248,14 +248,19 @@ retryable failure):
 - Findings carry no content excerpts. With a verified matching hash, the
   caller's own copy of the content is authoritative — slicing the span from it
   reproduces the evidence exactly.
-- `request_id` correlates with the audit record and service log entries.
-  The hash identifies the *content*; the request id identifies the
-  *assessment event* — identical content submitted twice shares a hash but
-  never a request id.
+- `request_id` is assigned immediately after successful authentication, before
+  the request body is read or validated. For a completed assessment, it
+  correlates with both the audit record and service log entries. For a rejected
+  authenticated request, it correlates with service logs only; validation
+  failures are not persisted. The hash identifies the *content*; the request id
+  identifies the *request event* — identical content submitted twice shares a
+  hash but never a request id.
 
 Errors: 400 with a machine-readable `reason` (`invalid_body`, `empty_content`,
 `content_too_large`, `content_hash_mismatch`, …), 401 for missing/invalid
-token, 500 with `request_id` for log correlation.
+token, 500 for internal failure. Every error after successful authentication
+includes `request_id` for log correlation; a 401 occurs before assignment and
+does not include one.
 
 ### 5.2 `GET /v1/assessments` (list)
 
@@ -418,9 +423,11 @@ The bearer token is the only secret; it lives in the file named by
 
 ## 8. Diagnostics
 
-Coverage follows `DIAGNOSTICS.md`. The service log is the durable evidence of
-what happened; it carries identifiers, hashes, rule ids, counts, sizes,
-statuses, and elapsed times — **never content, tokens, or secrets**.
+Coverage follows `DIAGNOSTICS.md`. Once initialized, the service log is the
+durable evidence of what happened; it carries identifiers, hashes, rule ids,
+counts, sizes, statuses, and elapsed times — **never content, tokens, or
+secrets**. Every fatal startup error is written to stderr; after the configured
+file logger initializes, it is written to the service log as well.
 
 Required lifecycle coverage mapped to this service:
 
@@ -428,7 +435,8 @@ Required lifecycle coverage mapped to this service:
   pattern/analyzer counts, compile success; database open (path, read-only vs
   write role) and schema verification; token file publication status (without
   the token); HTTP bind attempt and success; readiness; any fatal error with
-  its local cause.
+  its local cause. A failure that prevents obtaining or opening the configured
+  log path is reported to stderr because no service-log writer is available.
 - **Per assessment** (keyed by `request_id`): accepted (content size and
   `content_sha256`); validation failure with reason; pipeline start; findings
   summary (count per severity, rule ids — not matched text); verdict; when

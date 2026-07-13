@@ -2,8 +2,8 @@
 
 ## Core Rule
 
-Every meaningful lifecycle boundary and every error path must leave durable,
-useful evidence in the service log.
+Once the service log is initialized, every meaningful lifecycle boundary and
+every error path must leave durable, useful evidence there.
 
 The log must let an operator determine what started, what completed, what
 failed, where it failed, what durable state committed, what active state
@@ -13,6 +13,12 @@ transport failure.
 Terminal output, CLI output, comments, SQLite rows, and inferred state are not
 durable diagnostics. They may repeat facts, but the service log must contain
 the authoritative evidence.
+
+Startup fatal errors have an additional channel rule: every fatal startup error
+must be written to stderr. Once the configured file logger has initialized, the
+same error must also be written to the service log. A failure that prevents the
+service from obtaining or opening the configured log path can only use stderr;
+for that pre-logger boundary, stderr is the authoritative available evidence.
 
 ## Useful Logs
 
@@ -53,7 +59,9 @@ initialization, model-role boundaries, smoke checks, storage/cache
 initialization, HTTP bind attempt and success, readiness, and fatal startup
 errors. A subsystem absent by design requires no synthetic log. A configured or
 expected subsystem that is skipped, unavailable, or fails initialization must
-leave explicit diagnostic evidence.
+leave explicit diagnostic evidence. Fatal startup errors follow the startup
+channel rule above: always stderr, and also the service log once its writer is
+available.
 
 Every operation must log accepted, validation failure when applicable, each
 meaningful stage start and success/checkpoint, terminal result ready, terminal

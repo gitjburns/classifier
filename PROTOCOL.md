@@ -30,7 +30,8 @@ Authorization: Bearer <token>
 ```
 
 Tokens are provisioned by the service operator. Requests without a valid
-token receive `401`.
+token receive `401`. Authentication fails before an assessment request id is
+assigned, so these responses do not include `request_id`.
 
 ## 3. Assessing Content — `POST /v1/assess`
 
@@ -189,6 +190,13 @@ Error responses use this shape and never echo submitted content:
 ```json
 { "reason": "content_hash_mismatch", "request_id": "…" }
 ```
+
+For authenticated `POST /v1/assess` requests, the service assigns `request_id`
+before reading or validating the body. Every subsequent `400` or `500` response
+includes it for service-log correlation. A rejected request is not persisted,
+so its id cannot be retrieved through the assessment-history endpoints.
+Authentication failures occur before assignment, and errors from other
+endpoints may omit `request_id`.
 
 | Status | Reasons (non-exhaustive) | Retry? |
 |--------|--------------------------|--------|

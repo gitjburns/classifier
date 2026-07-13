@@ -11,6 +11,10 @@ Last updated: 2026-07-13
 - `AGENTS.md` SQLite rule amended for the service-owned audit store
   (single write path).
 - Implementation not started. Next step: Phase 0, awaiting approval.
+- The service is non-operational throughout Phases 0–10. It must not receive
+  caller traffic until every phase is complete and the user has explicitly
+  approved operational readiness. Explicitly approved phase-verification runs
+  are development checks, not operational use.
 
 | Phase | Title                                  | Status      |
 |-------|----------------------------------------|-------------|
@@ -39,21 +43,24 @@ Last updated: 2026-07-13
   could be tested later without the HTTP server or Tokio runtime.
 - Runtime verification that starts the server or touches the network requires
   separate explicit user approval at the point of use (Phases 7 and 9).
-- Creating or modifying `config.toml` (the live operator config) requires
-  explicit user approval; `config.example.toml` is a repository artifact
-  covered by phase approval.
+- Files created before operational readiness, including `config.toml`, the
+  token file, logs, and database, are scratch development state. Their creation,
+  modification, and deletion still require the approvals defined by
+  `AGENTS.md`.
+- Creating or modifying `config.toml` requires separate explicit user approval;
+  `config.example.toml` is a repository artifact covered by phase approval.
 
 ## Target Layout
 
 ```
 Cargo.toml
 config.example.toml        # committed defaults (Phase 1)
-config.toml                # operator copy, created only with approval (Phase 9)
+config.toml                # approved scratch config (Phase 1); reviewed for readiness in Phase 9
 rules.toml                 # shipped rule inventory (Phase 2)
 db/schema.sql              # audit store DDL (Phase 6)
-data/                      # operator-created; holds audit.db
-logs/                      # operator-created; holds classifier.log
-secrets/api-token          # operator-created bearer token file
+data/                      # scratch audit.db created in Phase 6
+logs/                      # scratch service log directory created in Phase 1
+secrets/api-token          # scratch bearer token file created in Phase 1
 src/
   main.rs                  # startup sequence, runtime assembly
   config.rs                # strict config model + loading
@@ -126,7 +133,8 @@ Steps:
 the fatal-error startup skeleton.
 
 Files: `src/config.rs`, `src/logging.rs`, `src/main.rs`,
-`config.example.toml`.
+`config.example.toml`; approved scratch verification artifacts:
+`config.toml`, `secrets/api-token`, `logs/`.
 
 Steps:
 
@@ -151,18 +159,29 @@ Steps:
    worker: DIAGNOSTICS.md treats the log as durable evidence, and a
    non-blocking writer can lose the final — most diagnostic — lines on a
    crash. Log volume here is low; durability wins over throughput.
-5. **Startup sequence** (`src/main.rs`): parse args → load config (fatal
-   errors to stderr, since file logging may not exist yet) → initialize
-   logging → then log, per DIAGNOSTICS.md: config path and parse success,
-   token file publication status (never the token), and each subsequent
-   initialization stage as later phases add them. `main` stays synchronous in
-   this phase; the Tokio runtime arrives in Phase 7.
+5. **Startup sequence** (`src/main.rs`): parse args → load config → initialize
+   logging → then continue initialization. Every fatal startup error is written
+   to stderr. Once the configured file logger has initialized, the same fatal
+   error is also written to the service log. Failures that prevent obtaining or
+   opening `logging.path` therefore use stderr alone. After logging initializes,
+   log the config path and parse success, token file publication status (never
+   the token), and each subsequent initialization stage as later phases add
+   them. `main` stays synchronous in this phase; the Tokio runtime arrives in
+   Phase 7.
 6. `config.example.toml`: the SPEC §7 example verbatim, as committed
    defaults.
+7. **Development verification artifacts**: with the required file-write
+   approvals, create scratch `config.toml`, `secrets/api-token`, and `logs/`
+   at their eventual repository-local paths. Creation or modification of
+   `config.toml` requires its own explicit approval. These artifacts exist only
+   to verify configuration, token loading, and durable logging; they do not make
+   the service operational, and this phase does not start a server.
 
 **Completion criteria**: cargo gate clean; running the binary against a
-missing/invalid config produces the specified fatal errors; a valid config +
-token file reaches "initialized" logging and exits cleanly (no server yet).
+missing/invalid config produces the specified fatal errors on stderr; fatal
+errors after file logging initializes appear on stderr and in the service log;
+a valid config + token file at the approved scratch paths reaches "initialized"
+logging and exits cleanly (no server yet).
 
 ---
 
@@ -363,7 +382,8 @@ module comments.
 **Goal**: schema file, explicit init command, write path, bounded read path —
 per SPEC §6 and the amended `AGENTS.md` SQLite rule.
 
-Files: `db/schema.sql`, `src/store.rs`, `src/bin/init_db.rs`.
+Files: `db/schema.sql`, `src/store.rs`, `src/bin/init_db.rs`; approved scratch
+verification artifacts: `data/`, `data/audit.db`.
 
 Steps:
 
@@ -379,7 +399,12 @@ Steps:
    derives the target name `init_db` and the documented command does not work.
    Output goes to stdout/stderr — this is an operator command, not the
    service. Run as: `cargo run --bin init-db -- --config config.toml`.
-3. **Connection roles** (`src/store.rs`):
+3. **Development database artifact**: with the required file-write and command
+   approvals, create `data/` and run
+   `cargo run --bin init-db -- --config config.toml` to initialize the scratch
+   `data/audit.db`. This database remains non-operational development state
+   until the final readiness approval.
+4. **Connection roles** (`src/store.rs`):
    - One **writer** connection, opened `READ_WRITE` (never `CREATE` — a
      missing file or missing schema at startup is fatal, and the error names
      the init command). Held behind a mutex; used only by the assessment
@@ -391,24 +416,24 @@ Steps:
      has no native statement timeout; the progress handler — behind the
      `hooks` feature from Phase 0 — is the explicit execution-boundary
      enforcement SPEC §6 requires).
-4. **Write path**: `persist_assessment(record) -> Result<()>` — one
+5. **Write path**: `persist_assessment(record) -> Result<()>` — one
    transaction inserting the assessments row and all findings rows.
    Lifecycle logging per DIAGNOSTICS.md: begin attempt, begin success,
    phase failures with `request_id`, commit attempt, commit success/failure.
-5. **Read path**: list query assembled from the SPEC §5.2 filters —
+6. **Read path**: list query assembled from the SPEC §5.2 filters —
    `verdict IN (…)`, `content_sha256 = ?`, `created_at_ms >= now_ms - hours`,
    keyset predicate `(created_at_ms, request_id) < (cursor.ts, cursor.id)` —
    ordered `created_at_ms DESC, request_id DESC`, fetching `limit + 1` rows
    to detect continuation. Detail query by `request_id` returns the full
    record including content columns.
-6. **SQL placement**: all statements as named `const` items at the top of
+7. **SQL placement**: all statements as named `const` items at the top of
    `store.rs` (PRINCIPLES §External-Language Artifacts; they are short
    operational statements — a separate query file is not warranted at this
    size).
-7. **Cursor encoding** (used by Phase 8, defined here with the keyset):
+8. **Cursor encoding** (used by Phase 8, defined here with the keyset):
    `hex("{created_at_ms}:{request_id}")` — opaque to callers, no new
    dependency. Decode failures are the caller error `invalid_cursor`.
-8. **Blocking boundary**: `store.rs` is synchronous `rusqlite` throughout;
+9. **Blocking boundary**: `store.rs` is synchronous `rusqlite` throughout;
    async callers (Phases 7–8) reach it via `tokio::task::spawn_blocking`.
    The boundary lives at the call site, not inside the store (PRINCIPLES
    §Async And Blocking Work).
@@ -440,29 +465,39 @@ Steps:
    against the loaded token in **constant time** (fold byte differences with
    bitwise OR over equal-length buffers; length mismatch handled without
    early exit) — a plain `==` on secrets leaks length/prefix timing. Failure
-   → 401, logged with the request path, never the presented token. Applied
-   to all routes except `/healthz`.
+   → 401 without a `request_id`, logged with the request path and never the
+   presented token. Authentication failures occur before an assessment
+   operation is accepted. Applied to all routes except `/healthz`.
 3. **Error module** (`error.rs`): the PROTOCOL.md error shape
    `{ "reason", "request_id"? }`; reason constants `invalid_body`,
    `empty_content`, `content_too_large`, `content_hash_mismatch`,
    `invalid_filter`, `invalid_cursor` as shared `const`s (compile-time-safe
-   cross-file contract). Error responses never echo content.
+   cross-file contract). Every authenticated `POST /v1/assess` error includes
+   `request_id`; authentication failures and errors from other endpoints may
+   omit it. Error responses never echo content.
 4. **Body limit**: request-body cap of `6 * max_content_bytes + 16 KiB`.
    The factor of six admits the worst-case JSON representation of content
    within the configured limit (each one-byte character encoded as `\uXXXX`);
    the fixed allowance covers the hash, JSON structure, and reasonable
-   whitespace. A breach maps to 400 `content_too_large`.
+   whitespace. A breach maps to 400 `content_too_large` with the assessment's
+   `request_id`.
 5. **`POST /v1/assess`** (`assess.rs`):
-   - Strict deserialize (`deny_unknown_fields`) → `invalid_body`.
+   - Immediately after authentication, assign `request_id` (UUID v4), start the
+     elapsed clock, and log operation start. This happens before reading or
+     validating the body, so every later failure can use the same identifier.
+   - Strict deserialize (`deny_unknown_fields`) → `invalid_body` with
+     `request_id`.
    - Validate: non-empty (`empty_content`), `content.len() ≤
-     max_content_bytes` (`content_too_large`).
+     max_content_bytes` (`content_too_large`). Log each failure with
+     `request_id` and return that identifier in the error response.
    - Compute SHA-256 of the received content bytes; compare its lowercase
      hex encoding **exactly** (byte-for-byte) to `content_sha256` →
      `content_hash_mismatch` on any difference. Uppercase input is a
      mismatch: PROTOCOL.md specifies lowercase hex, and strict parsing wins
-     over leniency.
-   - Assign `request_id` (UUID v4); start the elapsed clock; log acceptance
-     with content byte size and hash.
+     over leniency. Log a mismatch and return it with `request_id`.
+   - After validation succeeds, log acceptance with content byte size and hash.
+     Only validated assessments proceed to the pipeline and audit store;
+     rejected request IDs correlate with service logs but have no audit record.
    - Run the pipeline **inline** in the handler: it is bounded CPU work
      (input capped by `max_content_bytes`, linear-time regex), well under
      blocking-boundary thresholds; a `spawn_blocking` hop would add latency
@@ -527,16 +562,20 @@ hand-verified; live query verification deferred to Phase 9.
 ## Phase 9 — End-to-End Verification
 
 **Goal**: verify the assembled service against SPEC and DIAGNOSTICS
-requirements. Everything below that starts the server or creates operator
-files happens only with explicit user approval at the time.
+requirements. Everything below that starts the server or modifies scratch
+runtime state happens only with explicit user approval at the time.
 
 Steps:
 
-1. **Operator files** (each requiring approval): `config.toml` copied from
-   the example and adjusted; `secrets/api-token` with a generated token;
-   `data/` and `logs/` directories.
-2. **Initialize store**: `cargo run --bin init-db -- --config config.toml`;
-   verify the created schema; verify the double-run failure.
+1. **Operational-readiness artifact review**: validate every path and value in
+   the scratch `config.toml`; confirm appropriate permissions for
+   `secrets/api-token`, `data/audit.db`, and `logs/classifier.log`; replace the
+   development token if required. Every artifact modification requires explicit
+   approval, and every `config.toml` modification requires its own separate
+   explicit approval.
+2. **Store verification**: verify the schema created in Phase 6 and confirm
+   that `cargo run --bin init-db -- --config config.toml` fails rather than
+   modifying the existing database.
 3. **Startup**: run the service; walk the log against the DIAGNOSTICS.md
    startup checklist (config, rules version/counts, DB roles, bind,
    readiness).
@@ -586,10 +625,15 @@ Steps:
    and behavior against the completed repository and the Phase 9 observations.
    Remove planned or speculative wording and keep each fact owned by one
    canonical document.
+4. **Operational-readiness gate**: completing implementation and verification
+   does not authorize caller traffic. After all Phase 0–10 work is complete and
+   the status table is current, request the user's explicit approval before
+   treating the service as operationally ready.
 
 **Completion criteria**: both placeholders are replaced; the documentation
 matches the verified service; the status table is updated to complete with user
-approval.
+approval; the service remains non-operational unless the user separately
+approves operational readiness.
 
 ---
 
