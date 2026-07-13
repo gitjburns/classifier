@@ -1,10 +1,12 @@
 mod config;
 mod logging;
+mod rules;
+mod types;
 
 use std::process::ExitCode;
 use std::time::Instant;
 
-/// Runs the ordered startup boundaries and keeps Phase 1 intentionally non-serving.
+/// Runs the ordered startup boundaries and keeps the partially built service non-serving.
 fn main() -> ExitCode {
     let config_path = match config::config_path_from_args(config::process_args()) {
         Ok(path) => path,
@@ -42,27 +44,63 @@ fn main() -> ExitCode {
     let _token = match config::load_token(&config.auth.token_file) {
         Ok(token) => token,
         Err(error) => {
-            let elapsed_ms =
-                u64::try_from(token_load_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let token_elapsed_ms = elapsed_ms(token_load_started);
             tracing::error!(
                 stage = "token_load",
-                elapsed_ms,
+                elapsed_ms = token_elapsed_ms,
                 error = %error,
                 "fatal startup error"
             );
             return ExitCode::FAILURE;
         }
     };
-    let elapsed_ms = u64::try_from(token_load_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let token_elapsed_ms = elapsed_ms(token_load_started);
     tracing::info!(
         stage = "token_load",
         token_file = %config.auth.token_file.display(),
-        elapsed_ms,
+        elapsed_ms = token_elapsed_ms,
         "authentication token loaded"
     );
-    tracing::info!("phase 1 startup initialization complete; service is not yet serving");
+
+    // Rules compile as one startup unit so no request can observe a partially valid inventory.
+    let rules_load_started = Instant::now();
+    tracing::info!(
+        stage = "rules_load",
+        rules_path = %config.rules.path.display(),
+        "rules load and compilation started"
+    );
+    let ruleset = match rules::CompiledRuleset::load(&config.rules.path) {
+        Ok(ruleset) => ruleset,
+        Err(error) => {
+            let rules_elapsed_ms = elapsed_ms(rules_load_started);
+            tracing::error!(
+                stage = "rules_load",
+                rules_path = %config.rules.path.display(),
+                elapsed_ms = rules_elapsed_ms,
+                error = %error,
+                "fatal startup error"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let rules_elapsed_ms = elapsed_ms(rules_load_started);
+    tracing::info!(
+        stage = "rules_load",
+        rules_path = %config.rules.path.display(),
+        ruleset_version = %ruleset.version,
+        pattern_count = ruleset.patterns.len(),
+        enabled_analyzer_count = ruleset.analyzers.enabled_count(),
+        elapsed_ms = rules_elapsed_ms,
+        "rules loaded and compiled"
+    );
+    tracing::info!("phase 2 startup initialization complete; service is not yet serving");
 
     ExitCode::SUCCESS
+}
+
+/// Converts monotonic startup durations into the bounded millisecond field used by diagnostics.
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Reports failures through stderr while no durable service-log writer is available.

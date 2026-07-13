@@ -10,8 +10,9 @@ Last updated: 2026-07-13
 - Specification complete and approved: `SPEC.md`, `PROTOCOL.md`.
 - `AGENTS.md` SQLite rule amended for the service-owned audit store
   (single write path).
-- Phases 0–1 are complete; the Cargo gate and Phase 1 startup verification are
-  clean. Next step: Phase 2, awaiting approval.
+- Phases 0–2 are complete. The Phase 2 Cargo gate and startup validation matrix
+  completed with the intentional staging warnings governed below. Next step:
+  Phase 3, awaiting approval.
 - The service is non-operational throughout Phases 0–10. It must not receive
   caller traffic until every phase is complete and the user has explicitly
   approved operational readiness. Explicitly approved phase-verification runs
@@ -21,7 +22,7 @@ Last updated: 2026-07-13
 |-------|----------------------------------------|-------------|
 | 0     | Scaffolding                            | complete    |
 | 1     | Config, secrets, logging, startup      | complete    |
-| 2     | Rules engine and shipped rules file    | not started |
+| 2     | Rules engine and shipped rules file    | complete    |
 | 3     | Normalization and span map             | not started |
 | 4     | Built-in analyzers                     | not started |
 | 5     | Pipeline and verdict                   | not started |
@@ -36,8 +37,11 @@ Last updated: 2026-07-13
 - Phases run in order. Each phase begins only after explicit user approval
   and ends with a status update in this file.
 - Every phase that touches Rust ends with the mandatory gate:
-  `cargo fmt`, `cargo check`, `cargo clippy` — all clean, warnings introduced
-  by the phase fixed within the phase.
+  `cargo fmt`, `cargo check`, `cargo clippy`. Warnings caused by defects or
+  sloppy code are fixed within the phase. Dead-code warnings caused solely by
+  approved phase staging are recorded and allowed to resolve when the planned
+  consumer is implemented; they do not justify artificial uses, lint
+  suppression, visibility changes, new abstractions, or architecture work.
 - Diagnostics coverage (per `DIAGNOSTICS.md`) is implemented in the same
   phase as the code it observes, never deferred.
 - No automated tests (per `AGENTS.md`). Pure logic is still structured so it

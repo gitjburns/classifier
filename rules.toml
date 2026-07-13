@@ -1,0 +1,59 @@
+version = "2026-07-13.1"
+
+[analyzer.unicode-tags]
+enabled = true
+severity = "critical"
+
+[analyzer.zero-width]
+enabled = true
+severity = "suspect"
+
+[analyzer.bidi-override]
+enabled = true
+severity = "suspect"
+
+[analyzer.mixed-script]
+enabled = true
+severity = "suspect"
+
+[analyzer.encoded-blob]
+enabled = true
+severity = "suspect"
+min_run_length = 64
+min_entropy = 4.0
+
+[analyzer.high-nonascii]
+enabled = true
+severity = "advisory"
+max_ratio = 0.5
+min_total_chars = 200
+
+[[pattern]]
+id = "template-token"
+severity = "critical"
+description = "Literal chat-template control token"
+regex = '(?im)(<\|im_(start|end)\|>)|(\[/?INST\])|(<</?SYS>>)|(^#{2,4}[ \t]*(instruction|system)s?[ \t]*$)'
+
+[[pattern]]
+id = "instruction-override"
+severity = "suspect"
+description = "Directs the model to disregard prior instructions"
+regex = '(?i)\b(ignore|disregard|forget|override)\b[^.\n]{0,40}\b(previous|prior|above|earlier|all)\b[^.\n]{0,40}\b(instruction|prompt|rule|direction|guideline)s?\b'
+
+[[pattern]]
+id = "role-spoof"
+severity = "suspect"
+description = "Imitates a line-leading conversation participant label"
+regex = '(?im)^[ \t]*(system|assistant|developer)[ \t]*:[ \t]'
+
+[[pattern]]
+id = "prompt-extraction"
+severity = "suspect"
+description = "Requests disclosure of hidden instructions or configuration"
+regex = '(?i)\b(repeat|reveal|show|print|display|output)\b[^.\n]{0,60}\b(system[ \t]+prompt|initial[ \t]+prompt|your[ \t]+(instructions|prompt|rules)|hidden[ \t]+(instructions|prompt))\b'
+
+[[pattern]]
+id = "exfil-beacon"
+severity = "suspect"
+description = "Uses a Markdown link or image query string as an outbound beacon"
+regex = '(?i)!?\[[^\]]*\]\(\s*https?://[^)\s]+[?&][^)\s]+\)'
