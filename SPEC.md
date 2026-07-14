@@ -341,9 +341,11 @@ policy decision, out of scope for the MVP (no automatic expiry).
 
 Exactly one write path exists: the assessment pipeline persisting audit
 records. The query endpoints use read-only connections. All queries are
-bounded (row caps from config, wall-clock timeout); a capped result is always
-explicit (`next_cursor`), never silently truncated. This mirrors the SQLite
-rules in `AGENTS.md`.
+bounded by configured row caps and a wall-clock timeout. Assessment lists use
+`next_cursor` when more records exist. Findings reads fetch
+`max_findings_per_assessment + 1` rows and fail explicitly when that sentinel
+row exists; they never return partial evidence. This mirrors the SQLite rules
+in `AGENTS.md`.
 
 ### Schema
 
@@ -408,6 +410,7 @@ path = "data/audit.db"
 [query]
 default_limit = 50
 max_limit     = 500
+max_findings_per_assessment = 10000
 timeout_ms    = 2000
 
 [auth]

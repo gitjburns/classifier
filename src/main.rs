@@ -4,6 +4,7 @@ mod logging;
 mod normalize;
 mod pipeline;
 mod rules;
+mod store;
 mod types;
 
 use std::process::ExitCode;
@@ -31,6 +32,7 @@ fn main() -> ExitCode {
         database_path = %config.database.path.display(),
         query_default_limit = config.query.default_limit,
         query_max_limit = config.query.max_limit,
+        query_max_findings_per_assessment = config.query.max_findings_per_assessment,
         query_timeout_ms = config.query.timeout_ms,
         log_path = %config.logging.path.display(),
         "configuration loaded and service logging initialized"
@@ -96,7 +98,60 @@ fn main() -> ExitCode {
         elapsed_ms = rules_elapsed_ms,
         "rules loaded and compiled"
     );
-    tracing::info!("phase 2 startup initialization complete; service is not yet serving");
+    // Reuse the proven transport bound as the maximum SQLite cell size: it covers original and
+    // expanded sanitized content while preventing unbounded reads from externally altered files.
+    let max_cell_bytes = match config.limits.request_body_limit() {
+        Ok(limit) => limit,
+        Err(error) => {
+            tracing::error!(
+                stage = "audit_store_bounds",
+                error = %error,
+                "fatal startup error"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let store_open_started = Instant::now();
+    tracing::info!(
+        stage = "audit_store_open",
+        database_path = %config.database.path.display(),
+        writer_role = "read_write",
+        reader_role = "read_only_query_only",
+        query_timeout_ms = config.query.timeout_ms,
+        query_max_limit = config.query.max_limit,
+        query_max_findings_per_assessment = config.query.max_findings_per_assessment,
+        "audit store open and schema verification started"
+    );
+    let _store = match store::Store::open(
+        &config.database.path,
+        config.query.timeout_ms,
+        config.query.max_limit,
+        config.query.max_findings_per_assessment,
+        max_cell_bytes,
+    ) {
+        Ok(store) => store,
+        Err(error) => {
+            let store_elapsed_ms = elapsed_ms(store_open_started);
+            tracing::error!(
+                stage = "audit_store_open",
+                database_path = %config.database.path.display(),
+                elapsed_ms = store_elapsed_ms,
+                error = %error,
+                "fatal startup error"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let store_elapsed_ms = elapsed_ms(store_open_started);
+    tracing::info!(
+        stage = "audit_store_open",
+        database_path = %config.database.path.display(),
+        writer_role = "read_write",
+        reader_role = "read_only_query_only",
+        elapsed_ms = store_elapsed_ms,
+        "audit store opened and schema verified"
+    );
+    tracing::info!("phase 6 startup initialization complete; service is not yet serving");
 
     ExitCode::SUCCESS
 }

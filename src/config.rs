@@ -75,6 +75,8 @@ pub struct QueryConfig {
     pub default_limit: usize,
     /// Prevents callers from requesting unbounded result pages.
     pub max_limit: usize,
+    /// Caps evidence rows per assessment without permitting partial findings responses.
+    pub max_findings_per_assessment: usize,
     /// Bounds synchronous SQLite statement execution at the read boundary.
     pub timeout_ms: u64,
 }
@@ -135,6 +137,7 @@ impl Config {
             })?;
 
         config.limits.request_body_limit()?;
+        config.query.validate()?;
         Ok(config)
     }
 }
@@ -149,6 +152,19 @@ impl LimitsConfig {
                 key: "limits.max_content_bytes",
                 reason: "is too large to derive the HTTP request-body limit",
             })
+    }
+}
+
+impl QueryConfig {
+    /// Ensures the findings cap can always support a complete nonempty bounded query.
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_findings_per_assessment == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "query.max_findings_per_assessment",
+                reason: "must be greater than zero",
+            });
+        }
+        Ok(())
     }
 }
 

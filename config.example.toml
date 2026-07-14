@@ -13,6 +13,7 @@ path = "data/audit.db"
 [query]
 default_limit = 50
 max_limit = 500
+max_findings_per_assessment = 10000
 timeout_ms = 2000
 
 [auth]

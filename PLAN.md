@@ -10,11 +10,12 @@ Last updated: 2026-07-13
 - Specification complete and approved: `SPEC.md`, `PROTOCOL.md`.
 - `AGENTS.md` SQLite rule amended for the service-owned audit store
   (single write path).
-- Phases 0–5 are complete. The Phase 2 startup validation matrix and the Phase 3,
-  Phase 4, and Phase 5 Cargo gates and second-pass reviews completed with the
+- Phases 0–6 are complete. The Phase 2 startup validation matrix and the Phase 3
+  through Phase 6 Cargo gates and second-pass reviews completed with the
   intentional staging warnings governed below. Phase 4 follows its documented
-  MVP complexity ceiling, with broader Unicode shaping coverage deferred. Next
-  step: Phase 6, awaiting approval.
+  MVP complexity ceiling, with broader Unicode shaping coverage deferred. Phase
+  6 includes the approved 10,000-findings execution bound. Next step: Phase 7,
+  awaiting approval.
 - The service is non-operational throughout Phases 0–10. It must not receive
   caller traffic until every phase is complete and the user has explicitly
   approved operational readiness. Explicitly approved phase-verification runs
@@ -28,7 +29,7 @@ Last updated: 2026-07-13
 | 3     | Normalization and span map             | complete    |
 | 4     | Built-in analyzers                     | complete    |
 | 5     | Pipeline and verdict                   | complete    |
-| 6     | Audit store                            | not started |
+| 6     | Audit store                            | complete    |
 | 7     | HTTP service and assess endpoint       | not started |
 | 8     | Query API                              | not started |
 | 9     | End-to-end verification                | not started |
@@ -406,8 +407,9 @@ module comments.
 **Goal**: schema file, explicit init command, write path, bounded read path —
 per SPEC §6 and the amended `AGENTS.md` SQLite rule.
 
-Files: `db/schema.sql`, `src/store.rs`, `src/bin/init_db.rs`; approved scratch
-verification artifacts: `data/`, `data/audit.db`.
+Files: `Cargo.toml`, `db/schema.sql`, `src/store.rs`, `src/bin/init_db.rs`,
+`src/main.rs`, `src/config.rs`, `config.example.toml`, `SPEC.md`; approved
+scratch verification artifacts: `config.toml`, `data/`, `data/audit.db`.
 
 Steps:
 
@@ -440,16 +442,19 @@ Steps:
      has no native statement timeout; the progress handler — behind the
      `hooks` feature from Phase 0 — is the explicit execution-boundary
      enforcement SPEC §6 requires).
-5. **Write path**: `persist_assessment(record) -> Result<()>` — one
-   transaction inserting the assessments row and all findings rows.
-   Lifecycle logging per DIAGNOSTICS.md: begin attempt, begin success,
-   phase failures with `request_id`, commit attempt, commit success/failure.
+5. **Write path**: `persist_assessment(record) -> Result<()>` — reject records
+   above the configured `query.max_findings_per_assessment = 10000` bound,
+   then use one transaction to insert the assessment row and all findings rows.
+   Lifecycle logging per DIAGNOSTICS.md records each phase's start,
+   success/failure, `request_id`, and elapsed milliseconds.
 6. **Read path**: list query assembled from the SPEC §5.2 filters —
    `verdict IN (…)`, `content_sha256 = ?`, `created_at_ms >= now_ms - hours`,
    keyset predicate `(created_at_ms, request_id) < (cursor.ts, cursor.id)` —
    ordered `created_at_ms DESC, request_id DESC`, fetching `limit + 1` rows
    to detect continuation. Detail query by `request_id` returns the full
-   record including content columns.
+   record including content columns. Findings reads fetch
+   `max_findings_per_assessment + 1` rows and fail explicitly rather than
+   returning partial evidence when the configured bound is exceeded.
 7. **SQL placement**: all statements as named `const` items at the top of
    `store.rs` (PRINCIPLES §External-Language Artifacts; they are short
    operational statements — a separate query file is not warranted at this
@@ -465,7 +470,8 @@ Steps:
 **Completion criteria**: cargo gate clean; `init-db` verified against a
 scratch database file under `data/` (creates schema; second run fails as
 specified); startup schema verification produces the fatal error naming the
-init command when pointed at a missing/empty database.
+init command when pointed at a missing/empty database; second-pass review
+confirms configured findings bounds and complete persistence diagnostics.
 
 ---
 

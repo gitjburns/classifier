@@ -1,5 +1,6 @@
-target
-.cargo-home
-secrets
+target/
+.cargo-home/
+secrets/
 config.toml
-logs
+logs/
+data/
