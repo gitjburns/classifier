@@ -10,9 +10,9 @@ Last updated: 2026-07-13
 - Specification complete and approved: `SPEC.md`, `PROTOCOL.md`.
 - `AGENTS.md` SQLite rule amended for the service-owned audit store
   (single write path).
-- Phases 0–2 are complete. The Phase 2 Cargo gate and startup validation matrix
-  completed with the intentional staging warnings governed below. Next step:
-  Phase 3, awaiting approval.
+- Phases 0–3 are complete. The Phase 2 startup validation matrix and the Phase 3
+  Cargo gate and second-pass review completed with the intentional staging
+  warnings governed below. Next step: Phase 4, awaiting approval.
 - The service is non-operational throughout Phases 0–10. It must not receive
   caller traffic until every phase is complete and the user has explicitly
   approved operational readiness. Explicitly approved phase-verification runs
@@ -23,7 +23,7 @@ Last updated: 2026-07-13
 | 0     | Scaffolding                            | complete    |
 | 1     | Config, secrets, logging, startup      | complete    |
 | 2     | Rules engine and shipped rules file    | complete    |
-| 3     | Normalization and span map             | not started |
+| 3     | Normalization and span map             | complete    |
 | 4     | Built-in analyzers                     | not started |
 | 5     | Pipeline and verdict                   | not started |
 | 6     | Audit store                            | not started |
@@ -264,20 +264,19 @@ Design (recorded here because it is the hard part):
 
 1. **Segmentation.** Full-string NFKC cannot be mapped char-by-char because
    canonical composition crosses character boundaries (`e` + combining acute
-   → `é`). Instead, segment the original at **normalization-closed
-   boundaries**: a new segment starts at each character with canonical
-   combining class 0 (a starter), **except** Hangul jungseong
-   (U+1161–U+1175) and jongseong (U+11A8–U+11C2), which never begin a
-   segment. The Hangul exception exists because conjoining Jamo are the one
-   place NFKC composes two starters (L+V → LV, LV+T → LVT; U+1100 U+1161 →
-   U+AC00) — splitting between them would leave Jamo uncomposed where
-   full-string NFKC composes them. With V and T barred from beginning
-   segments, every composable pair — starter + non-starter, L+V, LV+T —
-   falls within a single segment (this also covers compatibility
-   decompositions whose output ends in a composable L, since the boundary
-   decision depends only on the following character), so NFKC applied per
-   segment equals NFKC of the whole string. Every ASCII character is its own
-   segment, so granularity is fine-grained exactly where text is ordinary.
+   → `é`). Instead, test a candidate **normalization-closed boundary** at each
+   original character with canonical combining class 0. Independently
+   normalize the current segment and candidate character; retain the boundary
+   only when the candidate's normalized form starts with a starter and
+   normalizing the concatenated normalized sides makes no further change.
+   Otherwise, keep the candidate in the current segment. This data-driven
+   check uses the Unicode normalization implementation as the authority for
+   every cross-starter composition, including Bengali split vowel signs and
+   Hangul L+V/LV+T, rather than maintaining an incomplete exception list. Once
+   the right side begins with a starter and the concatenation is already NFKC,
+   later input cannot change the normalized left side. Per-segment NFKC
+   therefore equals full-string NFKC, while every ASCII character still forms
+   its own fine-grained segment.
 2. **Map representation.** `Vec<Segment { norm_start, norm_end, orig_start,
    orig_end }>` in ascending order, with the normalized text built by
    concatenating per-segment NFKC output. The map is total: every normalized
@@ -296,9 +295,9 @@ Design (recorded here because it is the hard part):
 **Completion criteria**: cargo gate clean; module exposes
 `normalize(&str) -> Normalized` and
 `Normalized::to_original_span(Span) -> Span`; hand-verification against a
-worked set of cases (ASCII, combining sequences, conjoining Hangul Jamo —
-L+V and LV+T, full-width forms, mathematical alphanumerics, emoji ZWJ
-sequences) recorded in module comments.
+worked set of cases (ASCII, combining sequences, Bengali split vowel signs,
+conjoining Hangul Jamo — L+V and LV+T, full-width forms, mathematical
+alphanumerics, emoji ZWJ sequences) recorded in module comments.
 
 ---
 

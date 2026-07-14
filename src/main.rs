@@ -1,5 +1,6 @@
 mod config;
 mod logging;
+mod normalize;
 mod rules;
 mod types;
 
