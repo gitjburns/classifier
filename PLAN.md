@@ -10,16 +10,16 @@ Last updated: 2026-07-14
 - Specification complete and approved: `SPEC.md`, `PROTOCOL.md`.
 - `AGENTS.md` SQLite rule amended for the service-owned audit store
   (single write path).
-- Phases 0–8 are complete. The Phase 2 startup validation matrix and the Phase 3
-  through Phase 8 Cargo gates and second-pass reviews completed with the
-  intentional staging warnings governed below. Phase 4 follows its documented
-  MVP complexity ceiling, with broader Unicode shaping coverage deferred. Phase
-  6 includes the approved 10,000-findings execution bound. Phase 7 includes the
-  HTTP service, authenticated assess endpoint, health endpoint, and graceful
-  shutdown. Phase 8 includes the authenticated list and detail query endpoints,
-  strict bounded filters, and corrective query-error responses. Live request
-  verification remains deferred to Phase 9 as planned. Next step: Phase 9,
-  awaiting approval.
+- Phases 0–9 are complete. The Phase 2 startup validation matrix and the Phase 3
+  through Phase 8 Cargo gates and second-pass reviews completed. Phase 4 follows
+  its documented MVP complexity ceiling, with broader Unicode shaping coverage
+  deferred. Phase 6 includes the approved 10,000-findings execution bound.
+  Phases 7 and 8 provide the authenticated assessment and query APIs. Phase 9
+  verified scratch-artifact permissions, schema integrity and initializer
+  refusal, startup and graceful shutdown, all verdict paths, validation errors,
+  query filters and pagination, audit fidelity, and content-free durable logs
+  against the local service at `127.0.0.1:9090`. The Cargo gate is clean. Next
+  step: Phase 10, awaiting approval.
 - The service is non-operational throughout Phases 0–10. It must not receive
   caller traffic until every phase is complete and the user has explicitly
   approved operational readiness. Explicitly approved phase-verification runs
@@ -36,7 +36,7 @@ Last updated: 2026-07-14
 | 6     | Audit store                            | complete    |
 | 7     | HTTP service and assess endpoint       | complete    |
 | 8     | Query API                              | complete    |
-| 9     | End-to-end verification                | not started |
+| 9     | End-to-end verification                | complete    |
 | 10    | Documentation                           | not started |
 
 ## Process Rules
@@ -598,12 +598,14 @@ Steps:
    content retrieval is an individually auditable act (SPEC §5.3).
 4. Convert `created_at_ms` with the `time` crate and render it as RFC 3339 UTC
    `created_at` in responses (PROTOCOL.md shape).
-5. Extend `error.rs` with static reason constants `invalid_verdict_filter`,
-   `invalid_content_hash_filter`, `invalid_since_hours`, `invalid_limit`,
-   `invalid_cursor`, and `assessment_not_found`. Update `PROTOCOL.md` in the
-   same phase so its caller-facing reason inventory matches the implemented
-   contract; the response shape remains `{ "reason", "request_id"? }` with no
-   separate message field.
+5. Extend `error.rs` with the query reason constants `unknown_filter`,
+   `invalid_filter`, `invalid_verdict_filter`, `invalid_content_hash_filter`,
+   `invalid_since_hours`, `invalid_limit`, `invalid_cursor`,
+   `invalid_request_id`, and `assessment_not_found`. Caller-correctable query
+   errors include a human-readable `message` and reason-specific structured
+   fields; assessment, authentication, and internal errors retain the compact
+   `{ "reason", "request_id"? }` base shape. Update `PROTOCOL.md` in the same
+   phase so its caller-facing inventory matches the implemented contract.
 
 **Completion criteria**: cargo gate clean; parameter-validation matrix
 hand-verified; live query verification deferred to Phase 9.

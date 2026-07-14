@@ -111,8 +111,6 @@ pub struct CompiledPattern {
     pub id: String,
     /// Determines how matches participate in verdict selection.
     pub severity: Severity,
-    /// Explains the signal to operators and rule authors without containing matched text.
-    pub description: String,
     /// Guarantees linear-time matching over normalized untrusted content.
     pub regex: Regex,
 }
@@ -261,6 +259,8 @@ impl RulesFile {
                 });
             }
 
+            // Description is required author-facing metadata, not executable matching state.
+            drop(pattern.description);
             let regex = Regex::new(&pattern.regex).map_err(|source| RulesError::CompileRegex {
                 path: path.to_path_buf(),
                 rule_id: pattern.id.clone(),
@@ -269,7 +269,6 @@ impl RulesFile {
             patterns.push(CompiledPattern {
                 id: pattern.id,
                 severity: pattern.severity,
-                description: pattern.description,
                 regex,
             });
         }
