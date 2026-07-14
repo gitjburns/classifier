@@ -10,11 +10,11 @@ Last updated: 2026-07-13
 - Specification complete and approved: `SPEC.md`, `PROTOCOL.md`.
 - `AGENTS.md` SQLite rule amended for the service-owned audit store
   (single write path).
-- Phases 0–4 are complete. The Phase 2 startup validation matrix and the Phase 3
-  and Phase 4 Cargo gates and second-pass reviews completed with the intentional
-  staging warnings governed below. Phase 4 follows its documented MVP complexity
-  ceiling, with broader Unicode shaping coverage deferred. Next step: Phase 5,
-  awaiting approval.
+- Phases 0–5 are complete. The Phase 2 startup validation matrix and the Phase 3,
+  Phase 4, and Phase 5 Cargo gates and second-pass reviews completed with the
+  intentional staging warnings governed below. Phase 4 follows its documented
+  MVP complexity ceiling, with broader Unicode shaping coverage deferred. Next
+  step: Phase 6, awaiting approval.
 - The service is non-operational throughout Phases 0–10. It must not receive
   caller traffic until every phase is complete and the user has explicitly
   approved operational readiness. Explicitly approved phase-verification runs
@@ -27,7 +27,7 @@ Last updated: 2026-07-13
 | 2     | Rules engine and shipped rules file    | complete    |
 | 3     | Normalization and span map             | complete    |
 | 4     | Built-in analyzers                     | complete    |
-| 5     | Pipeline and verdict                   | not started |
+| 5     | Pipeline and verdict                   | complete    |
 | 6     | Audit store                            | not started |
 | 7     | HTTP service and assess endpoint       | not started |
 | 8     | Query API                              | not started |

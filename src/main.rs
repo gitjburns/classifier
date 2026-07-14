@@ -2,6 +2,7 @@ mod analyzers;
 mod config;
 mod logging;
 mod normalize;
+mod pipeline;
 mod rules;
 mod types;
 
