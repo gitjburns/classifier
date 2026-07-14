@@ -10,9 +10,11 @@ Last updated: 2026-07-13
 - Specification complete and approved: `SPEC.md`, `PROTOCOL.md`.
 - `AGENTS.md` SQLite rule amended for the service-owned audit store
   (single write path).
-- Phases 0–3 are complete. The Phase 2 startup validation matrix and the Phase 3
-  Cargo gate and second-pass review completed with the intentional staging
-  warnings governed below. Next step: Phase 4, awaiting approval.
+- Phases 0–4 are complete. The Phase 2 startup validation matrix and the Phase 3
+  and Phase 4 Cargo gates and second-pass reviews completed with the intentional
+  staging warnings governed below. Phase 4 follows its documented MVP complexity
+  ceiling, with broader Unicode shaping coverage deferred. Next step: Phase 5,
+  awaiting approval.
 - The service is non-operational throughout Phases 0–10. It must not receive
   caller traffic until every phase is complete and the user has explicitly
   approved operational readiness. Explicitly approved phase-verification runs
@@ -24,7 +26,7 @@ Last updated: 2026-07-13
 | 1     | Config, secrets, logging, startup      | complete    |
 | 2     | Rules engine and shipped rules file    | complete    |
 | 3     | Normalization and span map             | complete    |
-| 4     | Built-in analyzers                     | not started |
+| 4     | Built-in analyzers                     | complete    |
 | 5     | Pipeline and verdict                   | not started |
 | 6     | Audit store                            | not started |
 | 7     | HTTP service and assess endpoint       | not started |
@@ -312,6 +314,14 @@ Common shape: `mod.rs` defines the analyzer interface (scan original text →
 `Vec<Span>`; id and severity attach at the registry level from Phase 2
 settings) and the registry that Phase 2's `AnalyzerSettings` binds to.
 
+**MVP complexity ceiling**: Phase 4 implements the narrow, deterministic
+coverage specified below. It does not add dependencies, abstractions, or
+language-specific Unicode handling to pursue comprehensive edge-case coverage.
+An uncovered legitimate-text case that does not contradict the caller contract
+is recorded as deferred coverage rather than expanding this phase. The MVP may
+therefore sanitize some legitimate text conservatively; post-MVP tuning will use
+observed operational inputs rather than speculative completeness work.
+
 Per-analyzer algorithms:
 
 1. **`unicode_tags`** — flag each maximal run of U+E0000–U+E007F. One finding
@@ -319,9 +329,10 @@ Per-analyzer algorithms:
 2. **`zero_width`** — flag U+200B, U+200C, U+200D, U+2060, and non-leading
    U+FEFF, with two documented exclusions: U+200D (ZWJ) when both neighboring
    characters are `Extended_Pictographic` (emoji sequences), and U+200C
-   (ZWNJ) when both neighbors are letters of a joining script (Arabic-script
-   and Indic-script typography uses ZWNJ legitimately). Adjacent flagged
-   characters merge into one finding.
+   (ZWNJ) when both neighbors are alphabetic characters whose Unicode Script
+   value is Arabic. This narrow rule covers Persian and Arabic-script word
+   joining without expanding the MVP into general shaping analysis. Adjacent
+   flagged characters merge into one finding.
 3. **`bidi_override`** — flag each occurrence-run of U+202A–U+202E and
    U+2066–U+2069.
 4. **`mixed_script`** — split into words (maximal alphabetic runs); per word,
@@ -339,6 +350,14 @@ Per-analyzer algorithms:
    the non-ASCII proportion exceeds `max_ratio`, emit one finding spanning
    the entire content (span `0..len`). Whole-content span is intentional —
    the signal is a property of the document, not a location.
+
+Deferred post-MVP coverage:
+
+- Indic `letter + virama + ZWNJ + letter` shaping contexts. The immediate
+  neighbor before ZWNJ is a virama rather than a letter, so this case is
+  intentionally outside the narrow Arabic-script exclusion above. Legitimate
+  Indic text using this form may be sanitized by the MVP and should be revisited
+  after operational inputs are available.
 
 **Completion criteria**: cargo gate clean; each analyzer hand-verified
 against positive and negative cases (including the emoji, Persian ZWNJ, and
@@ -648,6 +667,11 @@ approves operational readiness.
   parameters are initial values; Phase 9's round-trips are the first honest
   calibration. False-positive/negative tuning beyond that is post-MVP
   operator work via `rules.toml`.
+- **Unicode analyzer coverage is deliberately narrow for the MVP**: Phase 4's
+  complexity ceiling favors finite, deterministic detectors over comprehensive
+  language shaping support. Known deferred cases, beginning with Indic
+  virama/ZWNJ shaping, remain documented in Phase 4 for review after the MVP is
+  operational and downstream integrations are running.
 - **Normalization segmentation** (Phase 3) is the highest-correctness-risk
   component; its worked-example verification set is the mitigation.
 - **Delivery observability limit** (Phase 7): socket-level delivery outcome

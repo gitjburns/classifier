@@ -1,3 +1,4 @@
+mod analyzers;
 mod config;
 mod logging;
 mod normalize;
