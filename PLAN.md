@@ -10,12 +10,14 @@ Last updated: 2026-07-13
 - Specification complete and approved: `SPEC.md`, `PROTOCOL.md`.
 - `AGENTS.md` SQLite rule amended for the service-owned audit store
   (single write path).
-- Phases 0–6 are complete. The Phase 2 startup validation matrix and the Phase 3
-  through Phase 6 Cargo gates and second-pass reviews completed with the
+- Phases 0–7 are complete. The Phase 2 startup validation matrix and the Phase 3
+  through Phase 7 Cargo gates and second-pass reviews completed with the
   intentional staging warnings governed below. Phase 4 follows its documented
   MVP complexity ceiling, with broader Unicode shaping coverage deferred. Phase
-  6 includes the approved 10,000-findings execution bound. Next step: Phase 7,
-  awaiting approval.
+  6 includes the approved 10,000-findings execution bound. Phase 7 includes the
+  HTTP service, authenticated assess endpoint, health endpoint, and graceful
+  shutdown; live request verification remains deferred to Phase 9 as planned.
+  Next step: Phase 8, awaiting approval.
 - The service is non-operational throughout Phases 0–10. It must not receive
   caller traffic until every phase is complete and the user has explicitly
   approved operational readiness. Explicitly approved phase-verification runs
@@ -30,7 +32,7 @@ Last updated: 2026-07-13
 | 4     | Built-in analyzers                     | complete    |
 | 5     | Pipeline and verdict                   | complete    |
 | 6     | Audit store                            | complete    |
-| 7     | HTTP service and assess endpoint       | not started |
+| 7     | HTTP service and assess endpoint       | complete    |
 | 8     | Query API                              | not started |
 | 9     | End-to-end verification                | not started |
 | 10    | Documentation                           | not started |
@@ -481,7 +483,7 @@ confirms configured findings bounds and complete persistence diagnostics.
 shapes, graceful shutdown — per SPEC §5.1/§5.4 and PROTOCOL.md.
 
 Files: `src/http/mod.rs`, `src/http/auth.rs`, `src/http/error.rs`,
-`src/http/assess.rs`; `src/main.rs` gains the Tokio runtime.
+`src/http/assess.rs`, `src/pipeline.rs`; `src/main.rs` gains the Tokio runtime.
 
 Steps:
 
@@ -498,13 +500,17 @@ Steps:
    → 401 without a `request_id`, logged with the request path and never the
    presented token. Authentication failures occur before an assessment
    operation is accepted. Applied to all routes except `/healthz`.
-3. **Error module** (`error.rs`): the PROTOCOL.md error shape
-   `{ "reason", "request_id"? }`; reason constants `invalid_body`,
-   `empty_content`, `content_too_large`, `content_hash_mismatch`,
-   `invalid_filter`, `invalid_cursor` as shared `const`s (compile-time-safe
-   cross-file contract). Every authenticated `POST /v1/assess` error includes
-   `request_id`; authentication failures and errors from other endpoints may
-   omit it. Error responses never echo content.
+3. **Error module** (`error.rs`): preserve the PROTOCOL.md error shape
+   `{ "reason", "request_id"? }` with no separate message field. Reasons are
+   human-readable machine identifiers defined as shared static `const`s so
+   responses remain useful, generic, and compile-time safe without exposing
+   source errors or implementation details. Phase 7 defines `unauthorized`,
+   `invalid_body`, `empty_content`, `content_too_large`,
+   `content_hash_mismatch`, `audit_persistence_failed`,
+   `audit_status_unknown`, and `internal_error`. Concrete store, task-join,
+   clock, and server errors remain in the service log. Every authenticated
+   `POST /v1/assess` error includes `request_id`; authentication failures and
+   errors from other endpoints may omit it. Error responses never echo content.
 4. **Body limit**: request-body cap of `6 * max_content_bytes + 16 KiB`.
    The factor of six admits the worst-case JSON representation of content
    within the configured limit (each one-byte character encoded as `\uXXXX`);
@@ -533,9 +539,16 @@ Steps:
      blocking-boundary thresholds; a `spawn_blocking` hop would add latency
      and complexity for no safety gain. This rationale is documented at the
      call site (PRINCIPLES §Async: tradeoff documented at the boundary).
-   - Persist via `spawn_blocking` → store write path. Write failure → 500
-     with `request_id` (SPEC §6: no verdict is reported whose audit evidence
-     did not commit).
+   - Extend `AssessmentOutcome` with `redaction_span_count`. The pipeline sets
+     it from the same merged suspect spans used for redaction and uses zero when
+     no sanitization is attempted, keeping diagnostic facts authoritative
+     without duplicating span-merging logic in the HTTP layer.
+   - Persist via `spawn_blocking` → store write path. A returned store failure
+     maps to 500 `audit_persistence_failed`; a task panic or cancellation maps
+     to 500 `audit_status_unknown`, because durable commit state cannot be
+     claimed. Other unexpected failures map to 500 `internal_error`. Each
+     response includes `request_id`, and no verdict is reported unless audit
+     persistence is confirmed (SPEC §6).
    - Respond per SPEC §5.1. Log verdict, findings count per severity,
      redaction span count and re-scan outcome when sanitizing, elapsed ms,
      and response handoff. **Delivery caveat**: the point of durable
@@ -557,18 +570,18 @@ explicit user approval and is otherwise deferred to Phase 9.
 **Goal**: `GET /v1/assessments` (list) and `GET /v1/assessments/{request_id}`
 (detail) — per SPEC §5.2/§5.3 and PROTOCOL.md §5.
 
-File: `src/http/query.rs`.
+Files: `src/http/query.rs`, `src/http/error.rs`, `PROTOCOL.md`.
 
 Steps:
 
 1. **Parameter parsing**, strict per SPEC:
    - `verdict`: comma-split; each token one of `safe|unsafe|sanitized`, or
      the single token `all`; unknown token, duplicate, or `all` combined
-     with anything → 400 `invalid_filter`. Omitted ≡ `all`.
+     with anything → 400 `invalid_verdict_filter`. Omitted ≡ `all`.
    - `content_sha256`: optional; must be 64 lowercase-hex chars →
-     `invalid_filter` otherwise.
-   - `since_hours`: optional; integer ≥ 1 → `invalid_filter` otherwise.
-   - `limit`: optional; 1 ≤ n ≤ `query.max_limit` → `invalid_filter`
+     `invalid_content_hash_filter` otherwise.
+   - `since_hours`: optional; integer ≥ 1 → `invalid_since_hours` otherwise.
+   - `limit`: optional; 1 ≤ n ≤ `query.max_limit` → `invalid_limit`
      otherwise; default `query.default_limit`.
    - `cursor`: optional; decoded per Phase 6 → `invalid_cursor` on any
      decode/shape failure.
@@ -577,12 +590,18 @@ Steps:
    `next_cursor` from the `limit + 1` sentinel row. Log acceptance with
    compact filter facts (which filters present, limit — not cursor
    contents), row count, whether capped, elapsed ms.
-3. **Detail handler**: UUID path parameter; unknown id → 404. Returns the
-   full record including `content` and `sanitized_content`. Each retrieval
-   logged with target `request_id` — content retrieval is an individually
-   auditable act (SPEC §5.3).
+3. **Detail handler**: UUID path parameter; unknown id → 404
+   `assessment_not_found`. Returns the full record including `content` and
+   `sanitized_content`. Each retrieval logged with target `request_id` —
+   content retrieval is an individually auditable act (SPEC §5.3).
 4. Convert `created_at_ms` with the `time` crate and render it as RFC 3339 UTC
    `created_at` in responses (PROTOCOL.md shape).
+5. Extend `error.rs` with static reason constants `invalid_verdict_filter`,
+   `invalid_content_hash_filter`, `invalid_since_hours`, `invalid_limit`,
+   `invalid_cursor`, and `assessment_not_found`. Update `PROTOCOL.md` in the
+   same phase so its caller-facing reason inventory matches the implemented
+   contract; the response shape remains `{ "reason", "request_id"? }` with no
+   separate message field.
 
 **Completion criteria**: cargo gate clean; parameter-validation matrix
 hand-verified; live query verification deferred to Phase 9.

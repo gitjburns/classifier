@@ -36,6 +36,8 @@ pub struct AssessmentOutcome {
     pub findings: Vec<Finding>,
     /// Exists only when the returned redacted content passed its full re-assessment.
     pub sanitized: Option<SanitizedOutput>,
+    /// Reports merged replaced spans, or zero when no sanitization attempt occurred.
+    pub redaction_span_count: usize,
     /// Is true only when a redaction attempt occurred and its complete re-scan was clean.
     pub rescan_clean: bool,
 }
@@ -72,6 +74,7 @@ fn assess_at_depth(
     }
 
     let merged_spans = merge_suspect_spans(&findings);
+    let redaction_span_count = merged_spans.len();
     let sanitized_content = redact(original, &merged_spans);
     let rescan = assess_at_depth(&sanitized_content, ruleset, redaction_rounds + 1);
     let rescan_clean = rescan.verdict == Verdict::Safe;
@@ -81,6 +84,7 @@ fn assess_at_depth(
             verdict: Verdict::Unsafe,
             findings,
             sanitized: None,
+            redaction_span_count,
             rescan_clean,
         };
     }
@@ -93,6 +97,7 @@ fn assess_at_depth(
             content: sanitized_content,
             sha256,
         }),
+        redaction_span_count,
         rescan_clean,
     }
 }
@@ -130,6 +135,7 @@ fn terminal_outcome(verdict: Verdict, findings: Vec<Finding>) -> AssessmentOutco
         verdict,
         findings,
         sanitized: None,
+        redaction_span_count: 0,
         rescan_clean: false,
     }
 }

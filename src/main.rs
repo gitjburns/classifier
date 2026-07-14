@@ -1,5 +1,6 @@
 mod analyzers;
 mod config;
+mod http;
 mod logging;
 mod normalize;
 mod pipeline;
@@ -8,10 +9,12 @@ mod store;
 mod types;
 
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Instant;
 
-/// Runs the ordered startup boundaries and keeps the partially built service non-serving.
-fn main() -> ExitCode {
+/// Runs ordered startup, serves only after readiness, and reports every terminal server boundary.
+#[tokio::main]
+async fn main() -> ExitCode {
     let config_path = match config::config_path_from_args(config::process_args()) {
         Ok(path) => path,
         Err(error) => return fatal_before_logging(&error),
@@ -46,7 +49,7 @@ fn main() -> ExitCode {
         token_file = %config.auth.token_file.display(),
         "authentication token load started"
     );
-    let _token = match config::load_token(&config.auth.token_file) {
+    let token = match config::load_token(&config.auth.token_file) {
         Ok(token) => token,
         Err(error) => {
             let token_elapsed_ms = elapsed_ms(token_load_started);
@@ -100,7 +103,7 @@ fn main() -> ExitCode {
     );
     // Reuse the proven transport bound as the maximum SQLite cell size: it covers original and
     // expanded sanitized content while preventing unbounded reads from externally altered files.
-    let max_cell_bytes = match config.limits.request_body_limit() {
+    let request_body_limit = match config.limits.request_body_limit() {
         Ok(limit) => limit,
         Err(error) => {
             tracing::error!(
@@ -122,12 +125,12 @@ fn main() -> ExitCode {
         query_max_findings_per_assessment = config.query.max_findings_per_assessment,
         "audit store open and schema verification started"
     );
-    let _store = match store::Store::open(
+    let store = match store::Store::open(
         &config.database.path,
         config.query.timeout_ms,
         config.query.max_limit,
         config.query.max_findings_per_assessment,
-        max_cell_bytes,
+        request_body_limit,
     ) {
         Ok(store) => store,
         Err(error) => {
@@ -151,9 +154,162 @@ fn main() -> ExitCode {
         elapsed_ms = store_elapsed_ms,
         "audit store opened and schema verified"
     );
-    tracing::info!("phase 6 startup initialization complete; service is not yet serving");
+    let bind_addr = config.server.bind_addr;
+    let state = Arc::new(http::AppState {
+        config,
+        request_body_limit,
+        token,
+        ruleset,
+        store,
+    });
+    let app = http::router(state);
 
-    ExitCode::SUCCESS
+    #[cfg(unix)]
+    let signal_registration_started = Instant::now();
+    #[cfg(unix)]
+    tracing::info!(
+        stage = "shutdown_signal_registration",
+        signal_count = 2,
+        "shutdown signal registration started"
+    );
+    #[cfg(unix)]
+    let shutdown_signals = match register_shutdown_signals() {
+        Ok(signals) => signals,
+        Err(error) => {
+            tracing::error!(
+                stage = "shutdown_signal_registration",
+                elapsed_ms = elapsed_ms(signal_registration_started),
+                error = %error,
+                "fatal startup error"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    #[cfg(unix)]
+    tracing::info!(
+        stage = "shutdown_signal_registration",
+        signal_count = 2,
+        elapsed_ms = elapsed_ms(signal_registration_started),
+        "shutdown signals registered"
+    );
+
+    let bind_started = Instant::now();
+    tracing::info!(
+        stage = "http_bind",
+        bind_addr = %bind_addr,
+        "HTTP listener bind attempt"
+    );
+    let listener = match tokio::net::TcpListener::bind(bind_addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::error!(
+                stage = "http_bind",
+                bind_addr = %bind_addr,
+                elapsed_ms = elapsed_ms(bind_started),
+                error = %error,
+                "fatal startup error"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(
+        stage = "http_bind",
+        bind_addr = %bind_addr,
+        elapsed_ms = elapsed_ms(bind_started),
+        "HTTP listener bound"
+    );
+    tracing::info!(
+        stage = "readiness",
+        bind_addr = %bind_addr,
+        "service ready to accept requests"
+    );
+
+    let serving_started = Instant::now();
+    tracing::info!(
+        stage = "http_serve",
+        bind_addr = %bind_addr,
+        "HTTP serving started"
+    );
+    #[cfg(unix)]
+    let shutdown = shutdown_signal(shutdown_signals);
+    #[cfg(not(unix))]
+    let shutdown = shutdown_signal();
+    match axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+    {
+        Ok(()) => {
+            tracing::info!(
+                stage = "shutdown",
+                elapsed_ms = elapsed_ms(serving_started),
+                "graceful shutdown completed"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            tracing::error!(
+                stage = "http_serve",
+                bind_addr = %bind_addr,
+                elapsed_ms = elapsed_ms(serving_started),
+                error = %error,
+                "HTTP server terminated with an error"
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Holds pre-registered Unix listeners so readiness is never published without shutdown control.
+#[cfg(unix)]
+type ShutdownSignals = (tokio::signal::unix::Signal, tokio::signal::unix::Signal);
+
+#[cfg(unix)]
+/// Registers interrupt and terminate listeners before the HTTP bind makes the service reachable.
+fn register_shutdown_signals() -> std::io::Result<ShutdownSignals> {
+    let interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    Ok((interrupt, terminate))
+}
+
+#[cfg(unix)]
+/// Waits for either supported Unix shutdown signal and records the trigger or stream failure.
+async fn shutdown_signal((mut interrupt, mut terminate): ShutdownSignals) {
+    tokio::select! {
+        received = interrupt.recv() => log_shutdown_trigger("SIGINT", received),
+        received = terminate.recv() => log_shutdown_trigger("SIGTERM", received),
+    }
+}
+
+#[cfg(unix)]
+/// Records whether a Unix signal arrived or its registered stream closed unexpectedly.
+fn log_shutdown_trigger(signal: &'static str, received: Option<()>) {
+    if received.is_some() {
+        tracing::info!(stage = "shutdown", signal, "graceful shutdown started");
+    } else {
+        tracing::error!(
+            stage = "shutdown",
+            signal,
+            "shutdown signal stream closed; graceful shutdown forced"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+/// Waits for the platform interrupt notification where Unix signal streams are unavailable.
+async fn shutdown_signal() {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => tracing::info!(
+            stage = "shutdown",
+            signal = "ctrl-c",
+            "graceful shutdown started"
+        ),
+        Err(error) => tracing::error!(
+            stage = "shutdown",
+            signal = "ctrl-c",
+            error = %error,
+            "shutdown signal listener failed; graceful shutdown forced"
+        ),
+    }
 }
 
 /// Converts monotonic startup durations into the bounded millisecond field used by diagnostics.
