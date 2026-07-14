@@ -5,19 +5,21 @@ contract), `PRINCIPLES.md`, `AGENTS.md`, `DIAGNOSTICS.md`.
 
 ## Current Status
 
-Last updated: 2026-07-13
+Last updated: 2026-07-14
 
 - Specification complete and approved: `SPEC.md`, `PROTOCOL.md`.
 - `AGENTS.md` SQLite rule amended for the service-owned audit store
   (single write path).
-- Phases 0–7 are complete. The Phase 2 startup validation matrix and the Phase 3
-  through Phase 7 Cargo gates and second-pass reviews completed with the
+- Phases 0–8 are complete. The Phase 2 startup validation matrix and the Phase 3
+  through Phase 8 Cargo gates and second-pass reviews completed with the
   intentional staging warnings governed below. Phase 4 follows its documented
   MVP complexity ceiling, with broader Unicode shaping coverage deferred. Phase
   6 includes the approved 10,000-findings execution bound. Phase 7 includes the
   HTTP service, authenticated assess endpoint, health endpoint, and graceful
-  shutdown; live request verification remains deferred to Phase 9 as planned.
-  Next step: Phase 8, awaiting approval.
+  shutdown. Phase 8 includes the authenticated list and detail query endpoints,
+  strict bounded filters, and corrective query-error responses. Live request
+  verification remains deferred to Phase 9 as planned. Next step: Phase 9,
+  awaiting approval.
 - The service is non-operational throughout Phases 0–10. It must not receive
   caller traffic until every phase is complete and the user has explicitly
   approved operational readiness. Explicitly approved phase-verification runs
@@ -33,7 +35,7 @@ Last updated: 2026-07-13
 | 5     | Pipeline and verdict                   | complete    |
 | 6     | Audit store                            | complete    |
 | 7     | HTTP service and assess endpoint       | complete    |
-| 8     | Query API                              | not started |
+| 8     | Query API                              | complete    |
 | 9     | End-to-end verification                | not started |
 | 10    | Documentation                           | not started |
 

@@ -1,6 +1,7 @@
 mod assess;
 mod auth;
 mod error;
+mod query;
 
 use std::sync::Arc;
 
@@ -35,6 +36,8 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
             "/v1/assess",
             post(assess::assess).layer(DefaultBodyLimit::max(state.request_body_limit)),
         )
+        .route("/v1/assessments", get(query::list_assessments))
+        .route("/v1/assessments/{request_id}", get(query::get_assessment))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_bearer,

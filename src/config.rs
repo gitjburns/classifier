@@ -156,8 +156,20 @@ impl LimitsConfig {
 }
 
 impl QueryConfig {
-    /// Ensures the findings cap can always support a complete nonempty bounded query.
+    /// Ensures configured defaults and execution caps always describe nonempty bounded queries.
     fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_limit == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "query.max_limit",
+                reason: "must be greater than zero",
+            });
+        }
+        if self.default_limit == 0 || self.default_limit > self.max_limit {
+            return Err(ConfigError::InvalidValue {
+                key: "query.default_limit",
+                reason: "must be within 1..=query.max_limit",
+            });
+        }
         if self.max_findings_per_assessment == 0 {
             return Err(ConfigError::InvalidValue {
                 key: "query.max_findings_per_assessment",

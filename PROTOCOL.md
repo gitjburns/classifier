@@ -185,7 +185,8 @@ Unauthenticated. `200` once the service is ready to accept requests.
 
 ## 6. Errors and Retries
 
-Error responses use this shape and never echo submitted content:
+Assessment, authentication, and internal error responses use this compact base
+shape and never echo submitted content:
 
 ```json
 { "reason": "content_hash_mismatch", "request_id": "…" }
@@ -198,12 +199,45 @@ so its id cannot be retrieved through the assessment-history endpoints.
 Authentication failures occur before assignment, and errors from other
 endpoints may omit `request_id`.
 
+Caller-correctable query errors add a `message` plus structured fields containing
+everything needed to repair the request. For example:
+
+```json
+{
+  "reason": "invalid_limit",
+  "message": "limit must be an integer within the returned inclusive bounds",
+  "parameter": "limit",
+  "required_type": "integer",
+  "minimum": 1,
+  "maximum": 500
+}
+```
+
+The corrective fields are reason-specific:
+
+| Reason | Additional fields |
+|--------|-------------------|
+| `unknown_filter` | `unknown_filters`, optional `duplicate_filters`, and the complete `valid_filters` list |
+| `invalid_filter` | optional exact `duplicate_filters` and `valid_filters`; when the query encoding itself is malformed, `message` identifies that requirement |
+| `invalid_verdict_filter` | `parameter`, optional `invalid_values`, optional `duplicate_values`, `valid_values`, and `constraints` |
+| `invalid_content_hash_filter` | `parameter` and `required_format` |
+| `invalid_since_hours` | `parameter`, `required_type`, and `minimum` |
+| `invalid_limit` | `parameter`, `required_type`, `minimum`, and the live configured `maximum` |
+| `invalid_cursor` | `parameter` and `correction`, which directs the caller to use an unmodified `next_cursor` |
+| `invalid_request_id` | path `parameter` and `required_format` |
+| `assessment_not_found` | `parameter`; the supplied value was a valid UUID but has no stored record |
+
+Unknown filter names, duplicate filter names, and invalid verdict values are
+returned only to the authenticated caller so it can correct the query. They are
+never written to the service log. Submitted content and cursor values are never
+echoed.
+
 | Status | Reasons (non-exhaustive) | Retry? |
 |--------|--------------------------|--------|
-| `400` | `invalid_body`, `empty_content`, `content_too_large`, `content_hash_mismatch`, `invalid_filter`, `invalid_cursor` | No — fix the request. A `content_hash_mismatch` that persists with a correct hash indicates transport-level text alteration; investigate before resubmitting. |
-| `401` | missing or invalid token | No — fix credentials. |
-| `404` | unknown `request_id` (detail endpoint only) | No. |
-| `500` | internal error; `request_id` included when available | Yes, with backoff. Include the `request_id` when reporting persistent failures to the operator. |
+| `400` | `invalid_body`, `empty_content`, `content_too_large`, `content_hash_mismatch`, `unknown_filter`, `invalid_filter`, `invalid_verdict_filter`, `invalid_content_hash_filter`, `invalid_since_hours`, `invalid_limit`, `invalid_cursor`, `invalid_request_id` | No — fix the request using the corrective fields. A `content_hash_mismatch` that persists with a correct hash indicates transport-level text alteration; investigate before resubmitting. |
+| `401` | `unauthorized` | No — fix credentials. |
+| `404` | `assessment_not_found` (detail endpoint only) | No. |
+| `500` | `audit_persistence_failed`, `audit_status_unknown`, `internal_error`; `request_id` included when available | Yes, with backoff. Include the `request_id` when reporting persistent failures to the operator. |
 
 Remember the fail-closed rule: no error status, timeout, or unparseable
 response ever clears content for forwarding.
