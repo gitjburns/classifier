@@ -37,6 +37,10 @@ assigned, so these responses do not include `request_id`.
 
 ### Request
 
+Send the body with `Content-Type: application/json`, in addition to the bearer
+authorization header from Section 2. A missing or unsupported content type is
+rejected with `400`, reason `invalid_body`.
+
 ```json
 {
   "content": "<text to assess>",

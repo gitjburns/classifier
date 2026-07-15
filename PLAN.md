@@ -10,7 +10,7 @@ Last updated: 2026-07-14
 - Specification complete and approved: `SPEC.md`, `PROTOCOL.md`.
 - `AGENTS.md` SQLite rule amended for the service-owned audit store
   (single write path).
-- Phases 0–9 are complete. The Phase 2 startup validation matrix and the Phase 3
+- Phases 0–10 are complete. The Phase 2 startup validation matrix and the Phase 3
   through Phase 8 Cargo gates and second-pass reviews completed. Phase 4 follows
   its documented MVP complexity ceiling, with broader Unicode shaping coverage
   deferred. Phase 6 includes the approved 10,000-findings execution bound.
@@ -18,12 +18,15 @@ Last updated: 2026-07-14
   verified scratch-artifact permissions, schema integrity and initializer
   refusal, startup and graceful shutdown, all verdict paths, validation errors,
   query filters and pagination, audit fidelity, and content-free durable logs
-  against the local service at `127.0.0.1:9090`. The Cargo gate is clean. Next
-  step: Phase 10, awaiting approval.
-- The service is non-operational throughout Phases 0–10. It must not receive
-  caller traffic until every phase is complete and the user has explicitly
-  approved operational readiness. Explicitly approved phase-verification runs
-  are development checks, not operational use.
+  against the local service at `127.0.0.1:9090`. The Cargo gate is clean. Phase
+  10 replaced the user and architecture placeholders with self-contained
+  documentation, verified `PROTOCOL.md` as a standalone caller contract, and
+  documented its required JSON content type. Operational-readiness approval
+  remains pending.
+- The service remains non-operational after completion of Phases 0–10. It must
+  not receive caller traffic until the user has explicitly approved operational
+  readiness. Explicitly approved phase-verification runs are development checks,
+  not operational use.
 
 | Phase | Title                                  | Status      |
 |-------|----------------------------------------|-------------|
@@ -37,7 +40,7 @@ Last updated: 2026-07-14
 | 7     | HTTP service and assess endpoint       | complete    |
 | 8     | Query API                              | complete    |
 | 9     | End-to-end verification                | complete    |
-| 10    | Documentation                           | not started |
+| 10    | Documentation                           | complete    |
 
 ## Process Rules
 
@@ -658,35 +661,48 @@ documented and accepted by the user; status table updated to complete.
 
 ## Phase 10 — Documentation
 
-**Goal**: replace the onboarding placeholders with user and developer
-documentation that describes the verified implementation rather than planned
-behavior.
+**Goal**: replace the onboarding placeholders with self-contained user and
+developer documentation that describes the verified implementation rather than
+planned behavior, and confirm the caller protocol remains fully standalone.
 
-Files: `README.md`, `ARCHITECTURE.md`.
+Files: `README.md`, `ARCHITECTURE.md`; `PROTOCOL.md` is reviewed and modified
+only if needed to satisfy its standalone caller-contract requirement.
 
 Steps:
 
 1. **User documentation** (`README.md`): document the service purpose,
    prerequisites, configuration and bearer-token setup, database
-   initialization, startup, and normal operation. Link to `PROTOCOL.md` for the
-   caller contract instead of duplicating its API definitions.
+   initialization, startup, and normal operation. The document must remain
+   complete after `SPEC.md` and `PLAN.md` are archived and must not reference
+   either file. It may link to `PROTOCOL.md` for the complete caller contract
+   instead of duplicating its API definitions.
 2. **Developer architecture** (`ARCHITECTURE.md`): document the implemented
    module boundaries and request/data flow, including the async HTTP boundary,
    synchronous SQLite roles, audit ownership, and durable diagnostics path.
-   Link to `SPEC.md` for design requirements rather than copying them.
-3. **Accuracy pass**: verify every documented command, path, configuration key,
+   Include the design requirements and rationale needed to understand the
+   implemented architecture directly in this document; it must remain complete
+   after `SPEC.md` and `PLAN.md` are archived and must not reference either
+   file.
+3. **Standalone caller protocol** (`PROTOCOL.md`): verify that the complete
+   externally shared caller contract is understandable outside this repository
+   and contains no references to any other repository files. Modify it only if
+   that review finds missing context or a repository-document dependency.
+4. **Accuracy pass**: verify every documented command, path, configuration key,
    and behavior against the completed repository and the Phase 9 observations.
-   Remove planned or speculative wording and keep each fact owned by one
-   canonical document.
-4. **Operational-readiness gate**: completing implementation and verification
+   Remove planned or speculative wording, keep each fact owned by one canonical
+   permanent document, and confirm no permanent document relies on `SPEC.md` or
+   `PLAN.md`.
+5. **Operational-readiness gate**: completing implementation and verification
    does not authorize caller traffic. After all Phase 0–10 work is complete and
    the status table is current, request the user's explicit approval before
    treating the service as operationally ready.
 
-**Completion criteria**: both placeholders are replaced; the documentation
-matches the verified service; the status table is updated to complete with user
-approval; the service remains non-operational unless the user separately
-approves operational readiness.
+**Completion criteria**: both placeholders are replaced; `README.md` and
+`ARCHITECTURE.md` stand on their own without referencing `SPEC.md` or `PLAN.md`;
+`PROTOCOL.md` stands on its own without referencing any other file; the
+documentation matches the verified service; the status table is updated to
+complete with user approval; the service remains non-operational unless the
+user separately approves operational readiness.
 
 ---
 
