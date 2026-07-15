@@ -16,8 +16,9 @@ use tracing_subscriber::registry::LookupSpan;
 /// Identifies fatal process events that must reach both stderr and the durable log.
 pub(crate) const PROCESS_ERROR_TARGET: &str = "classifier::process_error";
 
-// Console outcomes are derived operator summaries, not authoritative lifecycle evidence.
+// Console events are derived operator summaries, not authoritative lifecycle evidence.
 const CONSOLE_OUTCOME_TARGET: &str = "classifier::console_outcome";
+const STARTUP_MILESTONE_TARGET: &str = "classifier::startup_milestone";
 const ANSI_YELLOW: &str = "\x1b[33m";
 const ANSI_BOLD_RED: &str = "\x1b[1;31m";
 const ANSI_RESET: &str = "\x1b[0m";
@@ -207,6 +208,11 @@ pub(crate) fn console_error(message: String) {
     tracing::error!(target: CONSOLE_OUTCOME_TARGET, "{message}");
 }
 
+/// Emits one successful startup milestone without duplicating it in the durable log.
+pub(crate) fn startup_milestone(message: String) {
+    tracing::info!(target: STARTUP_MILESTONE_TARGET, "{message}");
+}
+
 /// Installs concise stderr routes and a complete synchronous durable-file route.
 pub fn initialize(path: &Path, level: LevelFilter) -> Result<(), LoggingError> {
     let file = OpenOptions::new()
@@ -220,7 +226,7 @@ pub fn initialize(path: &Path, level: LevelFilter) -> Result<(), LoggingError> {
     let file_writer = FileMakeWriter::new(file);
     let stderr_is_terminal = io::stderr().is_terminal();
 
-    // Console summaries are intentionally isolated from durable lifecycle evidence.
+    // Derived console events are intentionally isolated from durable lifecycle evidence.
     let console_layer = tracing_subscriber::fmt::layer()
         .with_writer(io::stderr)
         .event_format(ConsoleEventFormat {
@@ -229,7 +235,8 @@ pub fn initialize(path: &Path, level: LevelFilter) -> Result<(), LoggingError> {
         .with_filter(
             Targets::new()
                 .with_default(LevelFilter::OFF)
-                .with_target(CONSOLE_OUTCOME_TARGET, LevelFilter::TRACE),
+                .with_target(CONSOLE_OUTCOME_TARGET, LevelFilter::TRACE)
+                .with_target(STARTUP_MILESTONE_TARGET, LevelFilter::TRACE),
         );
     let process_error_layer = tracing_subscriber::fmt::layer()
         .with_writer(io::stderr)
@@ -245,7 +252,8 @@ pub fn initialize(path: &Path, level: LevelFilter) -> Result<(), LoggingError> {
         .with_filter(
             Targets::new()
                 .with_default(level)
-                .with_target(CONSOLE_OUTCOME_TARGET, LevelFilter::OFF),
+                .with_target(CONSOLE_OUTCOME_TARGET, LevelFilter::OFF)
+                .with_target(STARTUP_MILESTONE_TARGET, LevelFilter::OFF),
         );
     let subscriber = tracing_subscriber::registry()
         .with(console_layer)

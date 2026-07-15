@@ -161,6 +161,25 @@ Startup is fail-fast and ordered. Before accepting traffic, the process must:
 7. verify the required tables, columns, and indexes;
 8. register shutdown signals and bind the HTTP listener.
 
+After file logging initializes, stderr reports successful progress with seven
+concise lines in this order:
+
+```text
+STARTUP logging_initialized
+STARTUP cpu_parallelism_configured
+STARTUP token_loaded
+STARTUP rules_compiled
+STARTUP audit_store_verified
+STARTUP listener_bound
+READY
+```
+
+Each line includes the corresponding safe path, address, version, or count
+facts. A milestone is emitted only after its detailed durable success event, so
+the last visible line identifies the last completed startup boundary. The
+`READY` line is not emitted until every dependency is usable and the listener
+has bound.
+
 `GET /healthz` returns `200` without authentication only after this sequence has
 completed and the router is serving. The service log also records
 `service ready to accept requests` with `stage="readiness"`.
@@ -199,12 +218,13 @@ the database according to the operator's content-handling policy.
 ## Diagnostics and troubleshooting
 
 After file logging initializes, the configured append-only service log retains
-complete lifecycle evidence at `logging.level`. Stderr instead reports one
-concise line for each assessment outcome or authentication failure: `safe` is
-`INFO`, `sanitized` and caller-correctable rejections are yellow `WARN`, and
-`unsafe` verdicts and internal failures are bold-red `ERROR`. Color and emphasis
-are emitted only when stderr is a terminal. These derived summaries are excluded
-from the durable log; its structured terminal and lifecycle records remain
+complete lifecycle evidence at `logging.level`. Stderr reports the seven
+successful-startup milestones above and one concise line for each assessment
+outcome or authentication failure: `safe` is `INFO`, `sanitized` and
+caller-correctable rejections are yellow `WARN`, and `unsafe` verdicts and
+internal failures are bold-red `ERROR`. Color and emphasis are emitted only when
+stderr is a terminal. These derived milestones and summaries are excluded from
+the durable log; its structured terminal and lifecycle records remain
 authoritative. Fatal process errors also remain on stderr, and failures before
 the log file can be opened are available there only.
 

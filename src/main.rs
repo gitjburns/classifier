@@ -40,6 +40,13 @@ async fn main() -> ExitCode {
         log_path = %config.logging.path.display(),
         "configuration loaded and service logging initialized"
     );
+    // Each derived milestone follows its authoritative durable success event so stderr cannot
+    // claim that a later startup boundary completed when the detailed lifecycle record did not.
+    logging::startup_milestone(format!(
+        "STARTUP logging_initialized config_path={} bind_addr={}",
+        config_path.display(),
+        config.server.bind_addr
+    ));
 
     // Concurrency is fixed before serving so every request observes the same CPU-work bound.
     let pipeline_parallelism_started = Instant::now();
@@ -66,6 +73,9 @@ async fn main() -> ExitCode {
         elapsed_ms = elapsed_ms(pipeline_parallelism_started),
         "classification pipeline parallelism configured"
     );
+    logging::startup_milestone(format!(
+        "STARTUP cpu_parallelism_configured pipeline_parallelism={pipeline_parallelism}"
+    ));
     let pipeline_permits = Arc::new(tokio::sync::Semaphore::new(pipeline_parallelism));
 
     // The token stays in memory only; diagnostics expose its path, never its value. Duration
@@ -97,6 +107,10 @@ async fn main() -> ExitCode {
         elapsed_ms = token_elapsed_ms,
         "authentication token loaded"
     );
+    logging::startup_milestone(format!(
+        "STARTUP token_loaded token_file={}",
+        config.auth.token_file.display()
+    ));
 
     // Rules compile as one startup unit so no request can observe a partially valid inventory.
     let rules_load_started = Instant::now();
@@ -130,6 +144,12 @@ async fn main() -> ExitCode {
         elapsed_ms = rules_elapsed_ms,
         "rules loaded and compiled"
     );
+    logging::startup_milestone(format!(
+        "STARTUP rules_compiled ruleset_version={} pattern_count={} enabled_analyzer_count={}",
+        ruleset.version,
+        ruleset.patterns.len(),
+        ruleset.analyzers.enabled_count()
+    ));
     // Reuse the proven transport bound as the maximum SQLite cell size: it covers original and
     // expanded sanitized content while preventing unbounded reads from externally altered files.
     let request_body_limit = match config.limits.request_body_limit() {
@@ -185,6 +205,10 @@ async fn main() -> ExitCode {
         elapsed_ms = store_elapsed_ms,
         "audit store opened and schema verified"
     );
+    logging::startup_milestone(format!(
+        "STARTUP audit_store_verified database_path={}",
+        config.database.path.display()
+    ));
     let bind_addr = config.server.bind_addr;
     let state = Arc::new(http::AppState {
         config,
@@ -253,11 +277,13 @@ async fn main() -> ExitCode {
         elapsed_ms = elapsed_ms(bind_started),
         "HTTP listener bound"
     );
+    logging::startup_milestone(format!("STARTUP listener_bound bind_addr={bind_addr}"));
     tracing::info!(
         stage = "readiness",
         bind_addr = %bind_addr,
         "service ready to accept requests"
     );
+    logging::startup_milestone(format!("READY bind_addr={bind_addr}"));
 
     let serving_started = Instant::now();
     tracing::info!(

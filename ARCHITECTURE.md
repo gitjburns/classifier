@@ -104,8 +104,16 @@ arguments
 
 Argument and configuration failures occur before a configured logger exists and
 are reported to stderr. Once logging initializes, later fatal startup errors are
-written to stderr and the durable file. Nonfatal startup lifecycle records go to
-the file at the configured level.
+written to stderr and the durable file. Detailed nonfatal startup lifecycle
+records go to the file at the configured level. After each corresponding durable
+success event, a separate console-only target emits these message-only `INFO`
+milestones in order: `STARTUP logging_initialized`, `STARTUP
+cpu_parallelism_configured`, `STARTUP token_loaded`, `STARTUP rules_compiled`,
+`STARTUP audit_store_verified`, `STARTUP listener_bound`, and `READY`. Their safe
+fields identify the applicable configuration or token path, bind address,
+parallelism, ruleset version and counts, or database path. The durable file
+explicitly excludes this target because the milestones derive from, rather than
+replace, its authoritative lifecycle events.
 
 The process does not publish readiness until every dependency is usable and the
 listener has bound. Because the health route is reachable only through the
@@ -314,16 +322,17 @@ blocking Tokio worker threads.
 
 ## Diagnostics
 
-`logging.rs` separates three output roles. A message-only stderr layer emits one
-concise line for each assessment outcome or authentication failure: `safe` is an
-unstyled `INFO` event, `sanitized` and caller-correctable rejections are yellow
-`WARN`, and `unsafe` and internal failures are bold-red `ERROR`. ANSI styling is
-enabled only when stderr is a terminal. A second stderr layer retains formatted
-fatal process errors. The third layer is the synchronous line-buffered file
-opened in append mode; it records complete lifecycle evidence at the configured
-level and explicitly excludes the derived console-only summaries. Its parent
-directory must exist. There is no asynchronous logging worker or lossy queue
-between a lifecycle event and the shared file writer.
+`logging.rs` separates three output roles. A message-only stderr layer accepts
+two derived targets: the seven unstyled `INFO` startup milestones and one concise
+line for each assessment outcome or authentication failure. For outcomes, `safe`
+is an unstyled `INFO` event, `sanitized` and caller-correctable rejections are
+yellow `WARN`, and `unsafe` and internal failures are bold-red `ERROR`. ANSI
+styling is enabled only when stderr is a terminal. A second stderr layer retains
+formatted fatal process errors. The third layer is the synchronous line-buffered
+file opened in append mode; it records complete lifecycle evidence at the
+configured level and explicitly excludes both derived console-only targets. Its
+parent directory must exist. There is no asynchronous logging worker or lossy
+queue between a lifecycle event and the shared file writer.
 
 Diagnostics cover:
 

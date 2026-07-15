@@ -28,13 +28,19 @@ Last updated: 2026-07-15
   separately; stderr provides concise terminal outcomes while the durable file
   retains complete lifecycle evidence; and the permanent documentation reflects
   those boundaries. The Phase 11 Cargo gate (`cargo fmt`, `cargo check`, and
-  `cargo clippy`) is clean, and all independent-review findings were resolved.
-  Runtime/load verification, Phase 11 completion approval, and operational-
-  readiness approval remain pending.
-- The service remains non-operational while Phase 11 runtime verification and
-  operational readiness remain pending. It must not receive caller traffic until
-  the user has explicitly approved operational readiness. Explicitly approved
-  phase-verification runs are development checks, not operational use.
+  `cargo clippy`) is clean, all independent-review findings were resolved, and
+  the user confirmed that runtime/load verification was completed. Phase 11 is
+  complete.
+- Phase 12 is complete. Stderr now reports seven ordered successful-startup
+  milestones through readiness while detailed lifecycle events remain exclusive
+  to the authoritative durable log. `README.md` and `ARCHITECTURE.md` document the
+  new console behavior. The Phase 12 Cargo gate (`cargo fmt`, `cargo check`, and
+  `cargo clippy`) is clean. The user accepted skipping runtime console observation
+  as a verification deviation.
+- The service remains non-operational while operational-readiness approval is
+  pending. It must not receive caller traffic until the user has explicitly
+  approved operational readiness. Phase-verification runs are development checks,
+  not operational use.
 
 | Phase | Title                                  | Status               |
 |-------|----------------------------------------|----------------------|
@@ -49,7 +55,8 @@ Last updated: 2026-07-15
 | 8     | Query API                              | complete             |
 | 9     | End-to-end verification                | complete             |
 | 10    | Documentation                          | complete             |
-| 11    | Assessment throughput and robustness   | verification pending |
+| 11    | Assessment throughput and robustness   | complete             |
+| 12    | Concise startup milestones             | complete             |
 
 ## Process Rules
 
@@ -933,6 +940,100 @@ completes without unexplained request loss or an accepted deviation is documente
 by the user; no deferred suboptimization is implemented implicitly; and this
 status table is updated only after the user approves Phase 11 completion.
 Completing Phase 11 does not grant operational-readiness approval.
+
+---
+
+## Phase 12 — Concise Startup Milestones
+
+**Goal**: make successful startup visibly progress to readiness on stderr without
+restoring detailed lifecycle noise during normal operation. Durable file
+diagnostics remain the authoritative complete record.
+
+### Observed behavior and intent
+
+Phase 11 separated stderr from the durable service log. Stderr now accepts
+assessment/authentication outcome summaries and fatal process errors, while
+successful startup lifecycle events go only to the durable file. A healthy
+startup therefore appears silent until request traffic arrives.
+
+The operator needs a short, ordered confirmation that each required startup
+dependency initialized and that the listener reached readiness. This phase adds
+derived success milestones only; it does not mirror every detailed startup
+start/success event or re-enable operational lifecycle noise on stderr.
+
+### Scope and preserved invariants
+
+Files: `src/logging.rs`, `src/main.rs`, `README.md`, and `ARCHITECTURE.md`.
+
+- Add no configuration key, dependency, API field, route, database behavior,
+  migration, assessment behavior, or runtime fallback.
+- Keep every existing detailed startup and operation event in the durable file at
+  `logging.level`. Startup milestones are derived console-only events and must be
+  excluded from that file so they do not duplicate authoritative evidence.
+- Keep assessment/authentication console summaries, their levels and colors, and
+  fatal-process stderr routing unchanged.
+- Keep startup failures before logging on stderr and post-logger fatal process
+  failures on both stderr and the durable file.
+- Milestones contain only safe startup facts already present in durable
+  diagnostics; never include the bearer token or submitted content.
+
+### Implementation steps
+
+1. **Add a startup-milestone console route** (`src/logging.rs`):
+   - Define a dedicated startup-milestone tracing target and a helper that emits
+     plain `INFO` message-only lines.
+   - Extend the concise stderr formatter/filter to accept both existing outcome
+     summaries and the new startup milestones.
+   - Exclude both console-only targets from the durable file while leaving its
+     configured-level default and synchronous writer unchanged.
+
+2. **Emit seven ordered success milestones** (`src/main.rs`):
+   - `STARTUP logging_initialized` with the config path and bind address;
+   - `STARTUP cpu_parallelism_configured` with the classification parallelism;
+   - `STARTUP token_loaded` with the token-file path, never its contents;
+   - `STARTUP rules_compiled` with ruleset version, pattern count, and enabled
+     analyzer count;
+   - `STARTUP audit_store_verified` with the database path;
+   - `STARTUP listener_bound` with the bind address; and
+   - `READY` with the bind address after all startup dependencies succeed.
+
+   Emit each milestone only after the corresponding existing durable success
+   event. Absence of a later milestone plus the existing fatal stderr record must
+   identify where startup stopped without claiming readiness early.
+
+3. **Update permanent documentation** (`README.md`, `ARCHITECTURE.md`): describe
+   the concise startup sequence, its safe fields, the unchanged fatal-error path,
+   and the distinction between derived stderr milestones and authoritative
+   durable lifecycle events. Do not claim runtime observations before they are
+   verified.
+
+4. **Review and static verification**: inspect every edited region for target
+   ownership, ordering, secret exclusion, duplicate-file suppression, and useful
+   invariant comments. Run `cargo fmt`, `cargo check`, and `cargo clippy`.
+   Automated tests remain disabled.
+
+5. **Runtime console verification**: requires separate explicit approval because
+   it starts the service. In the implementation session, record the exact startup
+   and shutdown commands, config path, expected seven-line sequence, redirected-
+   stderr destination, and acceptance criteria before execution. Verify both a
+   terminal and redirected stderr when approved; redirected output must contain
+   no ANSI escapes. Do not combine this run with Phase 11 load verification unless
+   the user explicitly approves the combined scope.
+
+6. **Second-pass review**: verify the final code and documentation against
+   `PRINCIPLES.md` and `DIAGNOSTICS.md`, especially that successful startup is
+   visible, readiness is never emitted early, normal operation remains concise,
+   fatal startup evidence remains durable when logging exists, and console-only
+   milestones cannot enter the authoritative file.
+
+**Completion criteria**: the Cargo gate is clean; independent review finds no
+startup-ordering, secret, diagnostic-routing, or documentation regression; an
+approved runtime check observes exactly the seven ordered success milestones on
+stderr, no detailed operational lifecycle noise, no milestone duplicates in the
+durable file, and no ANSI escapes when stderr is redirected; and the status table
+is updated only after the user approves Phase 12 completion. Completing Phase 12
+does not complete Phase 11 runtime/load verification and does not grant
+operational-readiness approval.
 
 ---
 
