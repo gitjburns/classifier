@@ -1,14 +1,26 @@
 use std::error::Error;
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{self, LineWriter, Write};
+use std::io::{self, IsTerminal, LineWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use tracing::Subscriber;
-use tracing_subscriber::filter::LevelFilter;
-use tracing_subscriber::fmt::MakeWriter;
+use tracing::field::{Field, Visit};
+use tracing::{Event, Level, Subscriber};
+use tracing_subscriber::filter::{LevelFilter, Targets};
+use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
+use tracing_subscriber::fmt::{FmtContext, MakeWriter};
 use tracing_subscriber::layer::{Layer, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
+
+/// Identifies fatal process events that must reach both stderr and the durable log.
+pub(crate) const PROCESS_ERROR_TARGET: &str = "classifier::process_error";
+
+// Console outcomes are derived operator summaries, not authoritative lifecycle evidence.
+const CONSOLE_OUTCOME_TARGET: &str = "classifier::console_outcome";
+const ANSI_YELLOW: &str = "\x1b[33m";
+const ANSI_BOLD_RED: &str = "\x1b[1;31m";
+const ANSI_RESET: &str = "\x1b[0m";
 
 /// Preserves the exact boundary that prevented durable logging from initializing.
 #[derive(Debug)]
@@ -99,7 +111,103 @@ impl Write for FileWriter {
     }
 }
 
-/// Installs matching stderr and durable-file layers before any secret is loaded.
+/// Formats derived console outcomes as one message-only line with terminal-safe emphasis.
+#[derive(Clone, Copy)]
+struct ConsoleEventFormat {
+    ansi: bool,
+}
+
+impl<S, N> FormatEvent<S, N> for ConsoleEventFormat
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    N: for<'writer> FormatFields<'writer> + 'static,
+{
+    /// Omits metadata and fields so each console outcome remains exactly one concise line.
+    fn format_event(
+        &self,
+        _context: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        let style = if self.ansi {
+            match *event.metadata().level() {
+                Level::WARN => Some(ANSI_YELLOW),
+                Level::ERROR => Some(ANSI_BOLD_RED),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(style) = style {
+            fmt::Write::write_str(&mut writer, style)?;
+        }
+        let mut visitor = ConsoleMessageVisitor::new(&mut writer);
+        event.record(&mut visitor);
+        visitor.finish()?;
+        if style.is_some() {
+            fmt::Write::write_str(&mut writer, ANSI_RESET)?;
+        }
+        fmt::Write::write_char(&mut writer, '\n')
+    }
+}
+
+/// Writes only tracing's synthetic `message` field and discards all structured fields.
+struct ConsoleMessageVisitor<'writer, 'buffer> {
+    writer: &'writer mut Writer<'buffer>,
+    result: fmt::Result,
+}
+
+impl<'writer, 'buffer> ConsoleMessageVisitor<'writer, 'buffer> {
+    /// Binds message extraction to the formatter's current event buffer.
+    fn new(writer: &'writer mut Writer<'buffer>) -> Self {
+        Self {
+            writer,
+            result: Ok(()),
+        }
+    }
+
+    /// Returns any formatting failure after tracing has finished visiting fields.
+    fn finish(self) -> fmt::Result {
+        self.result
+    }
+
+    /// Records a message fragment only while the output writer remains healthy.
+    fn record_message(&mut self, field: &Field, value: fmt::Arguments<'_>) {
+        if field.name() == "message" && self.result.is_ok() {
+            self.result = fmt::Write::write_fmt(self.writer, value);
+        }
+    }
+}
+
+impl Visit for ConsoleMessageVisitor<'_, '_> {
+    /// Renders tracing's formatted message without exposing unrelated structured fields.
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        self.record_message(field, format_args!("{value:?}"));
+    }
+
+    /// Preserves string messages without the quotes added by debug formatting.
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.record_message(field, format_args!("{value}"));
+    }
+}
+
+/// Emits an unstyled successful outcome to the console-only tracing route.
+pub(crate) fn console_info(message: String) {
+    tracing::info!(target: CONSOLE_OUTCOME_TARGET, "{message}");
+}
+
+/// Emits a warning outcome that is yellow when stderr is an interactive terminal.
+pub(crate) fn console_warn(message: String) {
+    tracing::warn!(target: CONSOLE_OUTCOME_TARGET, "{message}");
+}
+
+/// Emits a failed outcome that is bold red when stderr is an interactive terminal.
+pub(crate) fn console_error(message: String) {
+    tracing::error!(target: CONSOLE_OUTCOME_TARGET, "{message}");
+}
+
+/// Installs concise stderr routes and a complete synchronous durable-file route.
 pub fn initialize(path: &Path, level: LevelFilter) -> Result<(), LoggingError> {
     let file = OpenOptions::new()
         .create(true)
@@ -110,16 +218,38 @@ pub fn initialize(path: &Path, level: LevelFilter) -> Result<(), LoggingError> {
             source,
         })?;
     let file_writer = FileMakeWriter::new(file);
+    let stderr_is_terminal = io::stderr().is_terminal();
 
-    let stderr_layer = tracing_subscriber::fmt::layer()
+    // Console summaries are intentionally isolated from durable lifecycle evidence.
+    let console_layer = tracing_subscriber::fmt::layer()
         .with_writer(io::stderr)
-        .with_filter(level);
+        .event_format(ConsoleEventFormat {
+            ansi: stderr_is_terminal,
+        })
+        .with_filter(
+            Targets::new()
+                .with_default(LevelFilter::OFF)
+                .with_target(CONSOLE_OUTCOME_TARGET, LevelFilter::TRACE),
+        );
+    let process_error_layer = tracing_subscriber::fmt::layer()
+        .with_writer(io::stderr)
+        .with_ansi(stderr_is_terminal)
+        .with_filter(
+            Targets::new()
+                .with_default(LevelFilter::OFF)
+                .with_target(PROCESS_ERROR_TARGET, LevelFilter::ERROR),
+        );
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(file_writer)
         .with_ansi(false)
-        .with_filter(level);
+        .with_filter(
+            Targets::new()
+                .with_default(level)
+                .with_target(CONSOLE_OUTCOME_TARGET, LevelFilter::OFF),
+        );
     let subscriber = tracing_subscriber::registry()
-        .with(stderr_layer)
+        .with(console_layer)
+        .with(process_error_layer)
         .with(file_layer);
 
     install_global(subscriber)

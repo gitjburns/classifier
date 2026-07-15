@@ -10,15 +10,20 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::routing::{get, post};
+use tokio::sync::Semaphore;
 
 use crate::config::Config;
 use crate::rules::CompiledRuleset;
 use crate::store::Store;
 
-/// Owns the immutable startup products and sole audit store shared by HTTP handlers.
+/// Owns startup products, execution controls, and the sole audit store shared by HTTP handlers.
 pub(crate) struct AppState {
     /// Retains validated operational limits and the listener configuration.
     pub(crate) config: Config,
+    /// Records the startup-detected CPU bound for pipeline scheduling diagnostics.
+    pub(crate) pipeline_parallelism: usize,
+    /// Carries owned permits into blocking tasks so cancellation cannot release capacity early.
+    pub(crate) pipeline_permits: Arc<Semaphore>,
     /// Carries the overflow-checked cap enforced before JSON deserialization.
     pub(crate) request_body_limit: usize,
     /// Retains the credential loaded after durable logging initialized.

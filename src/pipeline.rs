@@ -107,7 +107,11 @@ fn collect_findings(original: &str, ruleset: &CompiledRuleset) -> Vec<Finding> {
     let mut findings = analyzers::scan(original, &ruleset.analyzers);
     let normalized = normalize(original);
 
-    for pattern in &ruleset.patterns {
+    // One aggregate scan selects candidate indices in rules-file order. Individual matchers remain
+    // authoritative for repeated matches and exact spans; the set never constructs evidence.
+    let candidate_patterns = ruleset.pattern_prefilter.matches(&normalized.text);
+    for pattern_index in candidate_patterns.iter() {
+        let pattern = &ruleset.patterns[pattern_index];
         findings.extend(
             pattern
                 .regex

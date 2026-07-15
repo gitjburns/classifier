@@ -6,6 +6,8 @@ use axum::http::header::AUTHORIZATION;
 use axum::middleware::Next;
 use axum::response::Response;
 
+use crate::logging::console_warn;
+
 use super::AppState;
 use super::error::{ApiError, UNAUTHORIZED};
 
@@ -34,6 +36,12 @@ pub(crate) async fn require_bearer(
             path = %request.uri().path(),
             "request authentication failed"
         );
+        console_warn(format!(
+            "method={} path={} status={} reason={UNAUTHORIZED}",
+            request.method(),
+            request.uri().path(),
+            StatusCode::UNAUTHORIZED.as_u16()
+        ));
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, UNAUTHORIZED, None));
     }
 

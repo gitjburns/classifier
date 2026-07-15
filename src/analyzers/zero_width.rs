@@ -9,18 +9,15 @@ use crate::types::Span;
 /// interior one is reported; `👩‍💻` keeps its ZWJ; Persian letters on both sides keep their
 /// ZWNJ. Indic virama/ZWNJ shaping is deliberately deferred and remains reportable.
 pub(super) fn scan(content: &str) -> Vec<Span> {
-    let characters: Vec<(usize, char)> = content.char_indices().collect();
+    // A one-character lookaround is sufficient for both exclusions and avoids retaining the
+    // complete character stream solely to inspect immediate neighbors.
+    let mut characters = content.char_indices().peekable();
     let extended_pictographic = CodePointSetData::new::<ExtendedPictographic>();
     let mut spans: Vec<Span> = Vec::new();
+    let mut previous = None;
 
-    for (position, &(start, character)) in characters.iter().enumerate() {
-        let previous = position
-            .checked_sub(1)
-            .and_then(|index| characters.get(index))
-            .map(|&(_, character)| character);
-        let next = characters
-            .get(position + 1)
-            .map(|&(_, character)| character);
+    while let Some((start, character)) = characters.next() {
+        let next = characters.peek().map(|(_, character)| *character);
 
         let flagged = match character {
             '\u{200b}' | '\u{2060}' => true,
@@ -34,6 +31,8 @@ pub(super) fn scan(content: &str) -> Vec<Span> {
             let end = start + character.len_utf8();
             append_or_merge(&mut spans, Span { start, end });
         }
+
+        previous = Some(character);
     }
 
     spans

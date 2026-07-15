@@ -173,7 +173,7 @@ unavailable by construction, and rule authors must work within that subset.
 |------------------------|----------|----------|---------|
 | `unicode-tags`         | analyzer | critical | Tag-block characters (U+E0000–U+E007F), which can encode text invisible to human readers |
 | `template-token`       | pattern  | critical | Literal chat-template control tokens: `<\|im_start\|>`, `[INST]`, `### Instruction`, and similar |
-| `zero-width`           | analyzer | suspect  | Zero-width characters inside words; ZWJ within emoji sequences is excluded |
+| `zero-width`           | analyzer | suspect  | Selected zero-width controls; leading BOM, emoji-sequence ZWJ, and Arabic-script word-joining ZWNJ contexts are excluded |
 | `bidi-override`        | analyzer | suspect  | Directional formatting characters (U+202A–U+202E, U+2066–U+2069) |
 | `mixed-script`         | analyzer | suspect  | Characters from multiple scripts within a single word (look-alike substitution) |
 | `encoded-blob`         | analyzer | suspect  | Long high-entropy runs consistent with base64/hex encoding |
@@ -192,9 +192,12 @@ Severity assignments worth their rationale:
 - `template-token` is `critical`: these exact token sequences have no reason to
   exist in genuine user content — their presence imitates the model's own
   conversation framing, and such content is not eligible for sanitization.
-- `zero-width` excludes ZWJ inside emoji sequences because family/profession
-  emoji are composed with ZWJ; without the exclusion, every such emoji would be
-  a false positive.
+- `zero-width` flags U+200B, U+200C, U+200D, U+2060, and non-leading U+FEFF.
+  It excludes ZWJ directly between extended-pictographic characters because
+  family and profession emoji use that structure, and excludes ZWNJ directly
+  between Arabic-script letters because legitimate joining behavior uses that
+  structure. A leading U+FEFF is treated as a byte-order mark rather than a
+  concealed in-text control.
 
 ## 5. REST API
 

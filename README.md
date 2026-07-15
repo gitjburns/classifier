@@ -92,9 +92,10 @@ level = "info"
 
 Configuration is strict: every section and key is required, unknown keys are
 rejected, and invalid values are fatal. Relative paths are resolved from the
-service process's working directory. The available log levels are `trace`,
-`debug`, and `info`; quieter levels are intentionally unsupported because they
-would suppress required lifecycle records.
+service process's working directory. The available durable-log levels are
+`trace`, `debug`, and `info`; quieter levels are intentionally unsupported
+because they would suppress required lifecycle records. Concise stderr outcomes
+and fatal process errors use fixed routes independent of this setting.
 
 The settings have these effects:
 
@@ -110,7 +111,7 @@ The settings have these effects:
 | `query.timeout_ms` | SQLite busy timeout and wall-clock budget for each read-only query connection. |
 | `auth.token_file` | File containing the required bearer token. |
 | `logging.path` | Append-only service log. Its parent directory must already exist. |
-| `logging.level` | Shared minimum level for stderr and file diagnostics. |
+| `logging.level` | Minimum level for lifecycle diagnostics in the append-only service log. |
 
 `config.example.toml` is the visible starting point for operational values.
 `config.toml`, the token, database, and logs are environment-specific runtime
@@ -152,11 +153,13 @@ Startup is fail-fast and ordered. Before accepting traffic, the process must:
 
 1. load and validate the complete configuration;
 2. initialize stderr and file logging;
-3. load the bearer token;
-4. load and compile the complete ruleset;
-5. open the audit writer and verify an independent read-only database role;
-6. verify the required tables, columns, and indexes;
-7. register shutdown signals and bind the HTTP listener.
+3. detect the host's available CPU parallelism and create that many
+   classification permits;
+4. load the bearer token;
+5. load and compile the complete ruleset;
+6. open the audit writer and verify an independent read-only database role;
+7. verify the required tables, columns, and indexes;
+8. register shutdown signals and bind the HTTP listener.
 
 `GET /healthz` returns `200` without authentication only after this sequence has
 completed and the router is serving. The service log also records
@@ -172,6 +175,12 @@ All API routes except `/healthz` require the exact configured bearer token. Use
 the assessment verdict—not HTTP `200` alone—to decide whether content may be
 forwarded. Treat timeouts, transport failures, error responses, and unparseable
 responses as not cleared.
+
+Each accepted assessment waits for one startup-sized classification permit
+before the deterministic pipeline is dispatched to Tokio's blocking pool. The
+owned permit remains with the blocking task until classification finishes, even
+if its HTTP handler is cancelled, so abandoned requests cannot bypass the CPU
+work bound.
 
 The rules and token are immutable startup state. After deliberately changing
 `rules.toml` or rotating the token file, restart the service through the normal
@@ -189,12 +198,21 @@ the database according to the operator's content-handling policy.
 
 ## Diagnostics and troubleshooting
 
-After file logging initializes, lifecycle boundaries and failures are written to
-both stderr and the configured append-only service log. Failures that occur
-before the log file can be opened are available on stderr only. Logs contain
-safe identifiers, hashes, counts, limits, statuses, and elapsed times; they do
-not contain submitted content, full prompts, model output, bearer tokens, or
-cursor values.
+After file logging initializes, the configured append-only service log retains
+complete lifecycle evidence at `logging.level`. Stderr instead reports one
+concise line for each assessment outcome or authentication failure: `safe` is
+`INFO`, `sanitized` and caller-correctable rejections are yellow `WARN`, and
+`unsafe` verdicts and internal failures are bold-red `ERROR`. Color and emphasis
+are emitted only when stderr is a terminal. These derived summaries are excluded
+from the durable log; its structured terminal and lifecycle records remain
+authoritative. Fatal process errors also remain on stderr, and failures before
+the log file can be opened are available there only.
+
+Diagnostics contain safe identifiers, hashes, counts, limits, statuses, and
+elapsed times; they do not contain submitted content, full prompts, model output,
+bearer tokens, or cursor values. Assessment dispatch records permit-wait and
+pipeline-execution timing. Audit transaction-begin records include time spent
+waiting for the sole SQLite writer mutex.
 
 Common startup failures:
 
@@ -205,8 +223,9 @@ Common startup failures:
 - **The token cannot be loaded:** verify `auth.token_file`, service-user read
   access, and that the file is nonempty.
 - **Rules fail to load:** verify every built-in analyzer section is present,
-  rule IDs are unique, pattern IDs do not collide with analyzer IDs, and every
-  regular expression compiles.
+  rule IDs are unique, pattern IDs do not collide with analyzer IDs,
+  `high-nonascii.max_ratio` is finite and within `0.0..=1.0`, and every regular
+  expression compiles.
 - **The database is missing or has the wrong schema:** initialize a new database
   with `init-db`; do not attempt a runtime migration.
 - **The listener cannot bind:** verify `server.bind_addr` and that the address is

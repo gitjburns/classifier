@@ -270,13 +270,18 @@ impl Store {
             self.max_findings_per_assessment,
         )?;
         let elapsed_ms = i64_from_u64(record.elapsed_ms, "elapsed_ms")?;
-        let mut writer = self.lock_writer()?;
+        // Writer contention is scheduling time, not transaction time. Carry it into the existing
+        // begin-attempt event so the normal path gains no additional synchronous log write.
+        let writer_wait_started = Instant::now();
+        let mut writer = self.lock_writer(&record.request_id, writer_wait_started)?;
+        let writer_wait_elapsed_ms = duration_ms(writer_wait_started);
 
         let transaction_started = Instant::now();
         let begin_started = Instant::now();
         tracing::info!(
             request_id = %record.request_id,
             stage = "audit_transaction_begin",
+            writer_wait_elapsed_ms,
             "audit transaction begin attempt"
         );
         let transaction = writer.transaction().map_err(|source| {
@@ -502,11 +507,22 @@ impl Store {
         record_from_raw(raw, findings, self.max_cell_bytes).map(Some)
     }
 
-    /// Obtains the only write connection and reports poisoned ownership as a visible failure.
-    fn lock_writer(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
-        self.writer
-            .lock()
-            .map_err(|_| StoreError::WriterUnavailable)
+    /// Obtains the only write connection and records poisoned ownership at the failed boundary.
+    fn lock_writer(
+        &self,
+        request_id: &str,
+        wait_started: Instant,
+    ) -> Result<MutexGuard<'_, Connection>, StoreError> {
+        self.writer.lock().map_err(|_| {
+            tracing::error!(
+                request_id,
+                stage = "audit_writer_lock",
+                writer_wait_elapsed_ms = duration_ms(wait_started),
+                error = "audit writer mutex is poisoned",
+                "audit writer lock failed"
+            );
+            StoreError::WriterUnavailable
+        })
     }
 }
 

@@ -5,7 +5,7 @@ contract), `PRINCIPLES.md`, `AGENTS.md`, `DIAGNOSTICS.md`.
 
 ## Current Status
 
-Last updated: 2026-07-14
+Last updated: 2026-07-15
 
 - Specification complete and approved: `SPEC.md`, `PROTOCOL.md`.
 - `AGENTS.md` SQLite rule amended for the service-owned audit store
@@ -21,26 +21,35 @@ Last updated: 2026-07-14
   against the local service at `127.0.0.1:9090`. The Cargo gate is clean. Phase
   10 replaced the user and architecture placeholders with self-contained
   documentation, verified `PROTOCOL.md` as a standalone caller contract, and
-  documented its required JSON content type. Operational-readiness approval
-  remains pending.
-- The service remains non-operational after completion of Phases 0–10. It must
-  not receive caller traffic until the user has explicitly approved operational
-  readiness. Explicitly approved phase-verification runs are development checks,
-  not operational use.
+  documented its required JSON content type. Phase 11 implementation steps 1–10
+  are complete: classification uses startup-bounded blocking dispatch; ASCII
+  normalization and analyzer work use behavior-equivalent fast paths; pattern
+  matching uses a candidate-only `RegexSet`; writer contention is measured
+  separately; stderr provides concise terminal outcomes while the durable file
+  retains complete lifecycle evidence; and the permanent documentation reflects
+  those boundaries. The Phase 11 Cargo gate (`cargo fmt`, `cargo check`, and
+  `cargo clippy`) is clean, and all independent-review findings were resolved.
+  Runtime/load verification, Phase 11 completion approval, and operational-
+  readiness approval remain pending.
+- The service remains non-operational while Phase 11 runtime verification and
+  operational readiness remain pending. It must not receive caller traffic until
+  the user has explicitly approved operational readiness. Explicitly approved
+  phase-verification runs are development checks, not operational use.
 
-| Phase | Title                                  | Status      |
-|-------|----------------------------------------|-------------|
-| 0     | Scaffolding                            | complete    |
-| 1     | Config, secrets, logging, startup      | complete    |
-| 2     | Rules engine and shipped rules file    | complete    |
-| 3     | Normalization and span map             | complete    |
-| 4     | Built-in analyzers                     | complete    |
-| 5     | Pipeline and verdict                   | complete    |
-| 6     | Audit store                            | complete    |
-| 7     | HTTP service and assess endpoint       | complete    |
-| 8     | Query API                              | complete    |
-| 9     | End-to-end verification                | complete    |
-| 10    | Documentation                           | complete    |
+| Phase | Title                                  | Status               |
+|-------|----------------------------------------|----------------------|
+| 0     | Scaffolding                            | complete             |
+| 1     | Config, secrets, logging, startup      | complete             |
+| 2     | Rules engine and shipped rules file    | complete             |
+| 3     | Normalization and span map             | complete             |
+| 4     | Built-in analyzers                     | complete             |
+| 5     | Pipeline and verdict                   | complete             |
+| 6     | Audit store                            | complete             |
+| 7     | HTTP service and assess endpoint       | complete             |
+| 8     | Query API                              | complete             |
+| 9     | End-to-end verification                | complete             |
+| 10    | Documentation                          | complete             |
+| 11    | Assessment throughput and robustness   | verification pending |
 
 ## Process Rules
 
@@ -57,7 +66,7 @@ Last updated: 2026-07-14
 - No automated tests (per `AGENTS.md`). Pure logic is still structured so it
   could be tested later without the HTTP server or Tokio runtime.
 - Runtime verification that starts the server or touches the network requires
-  separate explicit user approval at the point of use (Phases 7 and 9).
+  separate explicit user approval at the point of use (Phases 7, 9, and 11).
 - Files created before operational readiness, including `config.toml`, the
   token file, logs, and database, are scratch development state. Their creation,
   modification, and deletion still require the approvals defined by
@@ -693,8 +702,8 @@ Steps:
    permanent document, and confirm no permanent document relies on `SPEC.md` or
    `PLAN.md`.
 5. **Operational-readiness gate**: completing implementation and verification
-   does not authorize caller traffic. After all Phase 0–10 work is complete and
-   the status table is current, request the user's explicit approval before
+   does not authorize caller traffic. After all scheduled phases are complete
+   and the status table is current, request the user's explicit approval before
    treating the service as operationally ready.
 
 **Completion criteria**: both placeholders are replaced; `README.md` and
@@ -703,6 +712,227 @@ Steps:
 documentation matches the verified service; the status table is updated to
 complete with user approval; the service remains non-operational unless the
 user separately approves operational readiness.
+
+---
+
+## Phase 11 — Assessment Throughput and Hot-Path Robustness
+
+**Goal**: increase assessment throughput and prevent CPU-heavy large requests
+from starving Tokio's HTTP work, while preserving the existing single-service,
+deterministic-pipeline, SQLite-audit architecture. This phase improves useful
+capacity first; it does not use rate limiting or overload rejection as its
+primary mechanism.
+
+### Observed evidence
+
+The repository-local `logs/classifier.log` and `data/audit.db` establish the
+following facts for the burst run from readiness at
+`2026-07-15T07:29:10.897734Z` through shutdown at
+`2026-07-15T08:46:03.514702Z`:
+
+- The user confirmed that requests were dropped before they became visible in
+  the assessment handler. Absence from the service log is therefore not evidence
+  that all offered traffic reached the process or router.
+- The handler recorded 616 assessment starts: 601 requests were accepted,
+  assessed, and persisted; 15 terminated during validation; no audit transaction
+  failed.
+- Successful handler-visible latency was 10 ms at p95, 19 ms at p99, and 30 ms
+  maximum. Pipeline execution reached 29 ms, while the persistence boundary was
+  7 ms at p99 and 14 ms maximum.
+- Pre-persistence elapsed time increased with accepted content size: 0.2 ms
+  average through 4 KiB, 2.9 ms from 4–16 KiB, 11.3 ms from 16–32 KiB, and
+  18.3 ms from 32–64 KiB.
+- Of the 601 accepted assessments, 352 contained ASCII-only content. The current
+  normalization map nevertheless creates a segment per ASCII character, and the
+  Unicode analyzers still scan that content even when their findings are
+  impossible.
+- SQLite persistence averaged approximately 1 ms per transaction in this run.
+  It is not the first demonstrated bottleneck; its writer-ownership wait is not
+  currently measured separately from the surrounding persistence boundary.
+
+These measurements describe requests that reached `assess`; runtime verification
+must also use the client-side offered-request count because the service cannot
+log a connection that never reaches it.
+
+### Scope and preserved invariants
+
+Files: `Cargo.toml`, `src/main.rs`, `src/logging.rs`, `src/http/mod.rs`,
+`src/http/auth.rs`, `src/http/error.rs`, `src/http/assess.rs`,
+`src/normalize.rs`, `src/analyzers/mod.rs`, `src/analyzers/zero_width.rs`,
+`src/rules.rs`, `src/pipeline.rs`, `src/store.rs`, `README.md`, and
+`ARCHITECTURE.md`.
+
+- `Cargo.toml` requires its own explicit configuration-file approval before its
+  Tokio feature list may be changed. No `config.toml` or
+  `config.example.toml` change is planned.
+- The HTTP paths, request and response shapes, verdict logic, finding order and
+  spans, redaction behavior, 65,536-byte content limit, rules file, and ruleset
+  version behavior remain unchanged.
+- SQLite remains synchronous and service-owned. The sole writer, one-transaction
+  assessment commit, read-only query roles, schema, and FULL durability remain
+  unchanged. No runtime migration, writer queue, batching, or additional write
+  path is introduced.
+- Existing durable-file diagnostic lifecycle events remain present and
+  content-free. Scheduling and writer-wait measurements enrich those records
+  without replacing authoritative evidence or adding writer-lock events to the
+  normal path. Stderr becomes a separate concise outcome channel; it does not
+  narrow or replace the durable service log.
+- This phase introduces no request rejection, rate limit, API error, hidden
+  fallback, or horizontal-deployment mechanism.
+
+### Implementation steps
+
+1. **Isolate classification CPU work from Tokio HTTP workers**
+   (`Cargo.toml`, `src/main.rs`, `src/http/mod.rs`, `src/http/assess.rs`):
+   - Enable Tokio's synchronization support in the existing dependency; do not
+     add a new executor dependency.
+   - At startup, obtain `std::thread::available_parallelism()` and fail visibly
+     if the process cannot determine a safe worker bound. Store an
+     `Arc<tokio::sync::Semaphore>` with that many permits in `AppState`.
+   - After authentication and request validation, asynchronously wait for one
+     CPU permit, then run `pipeline::assess` through
+     `tokio::task::spawn_blocking`. This is work scheduling, not caller-facing
+     load shedding: a request waits for available compute instead of being
+     rejected.
+   - Move the validated content into the blocking task and return it with the
+     `AssessmentOutcome`, avoiding a full-content clone before audit persistence.
+   - Move the owned permit into the blocking closure so cancellation of the HTTP
+     future cannot release CPU capacity while non-cancellable blocking work is
+     still running.
+   - Treat a blocking-task panic or cancellation as a pipeline internal error.
+     Log the local join facts and preserve the authenticated request ID; no audit
+     status is unknown because persistence has not started at this boundary.
+
+2. **Add identity normalization for ASCII input** (`src/normalize.rs`):
+   - Represent the span map explicitly as identity or segmented mapping. For
+     ASCII-only content, copy the normalized text once and translate every regex
+     span directly without allocating per-character `Segment` values or running
+     boundary NFKC probes.
+   - Retain the existing normalization-closed segmentation and outward rounding
+     unchanged for any input containing non-ASCII characters.
+   - Preserve empty-input behavior and all documented UTF-8 boundary invariants.
+     Comments must explain why identity translation is exact only for this path.
+
+3. **Avoid impossible Unicode-analyzer work on ASCII content**
+   (`src/analyzers/mod.rs`, `src/analyzers/zero_width.rs`):
+   - For ASCII-only input, run `encoded-blob`, whose alphabet is ASCII, but skip
+     `unicode-tags`, `zero-width`, `bidi-override`, `mixed-script`, and
+     `high-nonascii`; none can produce a finding for an all-ASCII byte sequence.
+   - For non-ASCII input, rewrite `zero-width` to maintain previous, current, and
+     next character state while iterating. Do not collect every character and
+     byte offset into a temporary vector.
+   - Preserve maximal-run merging and the existing emoji-ZWJ, Arabic-ZWNJ, and
+     leading-BOM decisions exactly.
+
+4. **Prefilter data-driven patterns in one pass**
+   (`src/rules.rs`, `src/pipeline.rs`):
+   - Compile a `regex::RegexSet` from the same validated pattern strings during
+     atomic ruleset construction. A set-compilation failure remains a fatal
+     rules-load error with its source context.
+   - Scan normalized text once with the set. Run an individual compiled regex
+     only for indices reported by that set so the existing regex remains the
+     authoritative source of exact match spans.
+   - Preserve rules-file order, repeated matches, normalized-to-original span
+     translation, finding ordering, and rule IDs. The set is only a negative
+     prefilter; it never constructs or replaces evidence.
+
+5. **Make scheduling and writer contention diagnosable**
+   (`src/http/assess.rs`, `src/store.rs`):
+   - Add a pipeline-dispatch boundary recording wait start, permit acquisition,
+     wait duration, configured parallelism, task completion, join failure, and
+     execution duration. Retain the existing finding/verdict pipeline summary.
+   - Measure the writer mutex wait before the audit transaction begins. Add the
+     wait duration and request ID to an existing persistence lifecycle record so
+     the normal path performs no additional synchronous log write. Mutex
+     poisoning remains its own error record. Keep writer wait separate from
+     transaction duration.
+   - Keep submitted content, matched excerpts, tokens, and other forbidden data
+     out of every new event.
+
+6. **Make stderr a concise color-coded outcome channel**
+   (`src/logging.rs`, `src/main.rs`, `src/http/auth.rs`, `src/http/error.rs`,
+   `src/http/assess.rs`, `README.md`, `ARCHITECTURE.md`):
+   - Give console-only summary events a dedicated tracing target. The stderr
+     layer accepts only that target and required fatal process errors; the
+     durable file layer excludes console-only events and retains every existing
+     detailed lifecycle event at the configured level. Console prominence must
+     not change the severity of the authoritative file event for an expected
+     domain verdict.
+   - Emit exactly one terminal console line for each assessment attempt. A
+     successfully persisted `safe` verdict is visually quiet at `INFO`.
+     `sanitized` is prominent yellow at `WARN`. `unsafe` is bold red at `ERROR`
+     and begins with `UNSAFE`. Caller-correctable rejection is prominent yellow
+     at `WARN`; internal, persistence, and unknown-audit-status failures are bold
+     red at `ERROR`.
+   - Include the caller-visible `request_id` when one exists, plus HTTP status,
+     verdict or reason, and enough compact outcome facts to correlate the line
+     with the caller response. Authentication failures occur before request-ID
+     assignment by protocol and instead include method, path, status, and reason.
+     Never include submitted content, tokens, excerpts, or cursor values.
+   - Use ANSI color only when stderr is a terminal. Redirected stderr remains
+     plain text without escape sequences. Fatal startup errors remain on stderr
+     and, once file logging exists, in the durable service log.
+   - Update the permanent documentation to describe the distinct concise stderr
+     and complete durable-file roles rather than claiming that their output
+     matches.
+
+7. **Second-pass review**: verify the edited regions against `PRINCIPLES.md` and
+   `DIAGNOSTICS.md`, with particular attention to CPU/blocking ownership,
+   cancellation, exact span semantics, finding completeness, source-context
+   errors, lossless durable-file diagnostics, single-line console routing, and
+   comments explaining the new invariants.
+
+### Explicitly deferred follow-up
+
+Use Phase 11 runtime evidence before proposing any of these independently
+approvable changes:
+
+- combining the two tracing formatting layers or reducing file-writer lock
+  acquisitions while retaining synchronous durable lifecycle evidence;
+- replacing per-request persistence tasks with a dedicated writer coordinator
+  or batching transactions;
+- replacing the list endpoint's per-assessment findings queries with one bounded
+  page-level findings query; or
+- incrementally decoding JSON to reject oversized decoded content before the
+  current bounded body has been buffered.
+
+These are real suboptimizations, but the recorded run does not establish them as
+the cause of pre-handler loss. They must not expand this phase without a new
+proposal and explicit approval.
+
+### Verification
+
+1. Run the mandatory Rust gate: `cargo fmt`, `cargo check`, `cargo clippy`.
+   Automated tests remain disabled.
+2. Inspect every edited function and nearby invariant comment after formatting.
+   Confirm the ASCII and non-ASCII paths retain the same externally visible
+   verdict, finding, and span semantics by worked-case review.
+3. Verify that stderr emits exactly one terminal line for safe, sanitized,
+   unsafe, validation-failure, authentication-failure, and internal-failure
+   paths; that their levels, labels, and terminal colors match the specified
+   prominence; and that redirected stderr contains no ANSI escapes. Confirm the
+   durable file still contains the complete lifecycle for the same operations,
+   contains no console-only duplicate, and remains content-free.
+4. Runtime load verification requires separate explicit approval because it
+   starts the service and uses the loopback network. Before execution, record the
+   exact user-approved load command, offered request count, concurrency, content
+   size distribution, client timeout, and acceptance criteria; do not infer
+   them.
+5. Reconcile client-side offered, completed, rejected, timed-out, and transport-
+   failed counts with service-side validation, pipeline, audit, and response
+   lifecycle counts. Service logs alone are not proof that no request was lost.
+6. Compare pipeline dispatch wait, execution time, writer wait, persistence time,
+   end-to-end latency, CPU utilization when available from the approved load
+   harness, and throughput by content-size bucket against the recorded baseline.
+
+**Completion criteria**: Cargo formatting, compilation, and linting are clean;
+second-pass review finds no contract, audit, diagnostic, or span-mapping
+regression; console output has the approved single-line prominence without
+narrowing or duplicating durable-file evidence; the approved burst workload
+completes without unexplained request loss or an accepted deviation is documented
+by the user; no deferred suboptimization is implemented implicitly; and this
+status table is updated only after the user approves Phase 11 completion.
+Completing Phase 11 does not grant operational-readiness approval.
 
 ---
 

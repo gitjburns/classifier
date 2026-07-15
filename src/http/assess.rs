@@ -15,9 +15,9 @@ use super::error::{
     AUDIT_PERSISTENCE_FAILED, AUDIT_STATUS_UNKNOWN, ApiError, CONTENT_HASH_MISMATCH,
     CONTENT_TOO_LARGE, EMPTY_CONTENT, INTERNAL_ERROR, INVALID_BODY,
 };
-use crate::pipeline;
 use crate::store::AssessmentRecord;
 use crate::types::{Finding, Severity, Verdict};
+use crate::{logging, pipeline};
 
 /// Defines the complete strict caller input for one assessment operation.
 #[derive(Deserialize)]
@@ -177,16 +177,92 @@ pub(crate) async fn assess(
         "assessment request accepted"
     );
 
-    let pipeline_started = Instant::now();
+    let pipeline_wait_started = Instant::now();
     tracing::info!(
         request_id = %request_id,
-        stage = "assessment_pipeline",
+        stage = "assessment_pipeline_dispatch",
         ruleset_version = %state.ruleset.version,
-        "assessment pipeline started"
+        pipeline_parallelism = state.pipeline_parallelism,
+        "assessment pipeline permit wait started"
     );
-    // The configured input cap and linear-time rule engine bound this CPU-only work; keeping it
-    // inline avoids treating a pure transformation as blocking I/O.
-    let outcome = pipeline::assess(&payload.content, &state.ruleset);
+    let permit = match Arc::clone(&state.pipeline_permits).acquire_owned().await {
+        Ok(permit) => permit,
+        Err(error) => {
+            tracing::error!(
+                request_id = %request_id,
+                stage = "assessment_pipeline_dispatch",
+                reason = INTERNAL_ERROR,
+                pipeline_parallelism = state.pipeline_parallelism,
+                wait_elapsed_ms = duration_ms(pipeline_wait_started),
+                operation_elapsed_ms = duration_ms(operation_started),
+                error = %error,
+                "assessment terminal error ready"
+            );
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                INTERNAL_ERROR,
+                Some(request_id),
+            ));
+        }
+    };
+    let pipeline_wait_ms = duration_ms(pipeline_wait_started);
+    tracing::info!(
+        request_id = %request_id,
+        stage = "assessment_pipeline_dispatch",
+        pipeline_parallelism = state.pipeline_parallelism,
+        wait_elapsed_ms = pipeline_wait_ms,
+        "assessment pipeline permit acquired"
+    );
+
+    let pipeline_task_started = Instant::now();
+    let pipeline_state = Arc::clone(&state);
+    let pipeline_request_id = request_id.clone();
+    let pipeline_task_request_id = request_id.clone();
+    let content = payload.content;
+    // The owned permit stays inside the non-cancellable closure so dropping the HTTP future cannot
+    // advertise CPU capacity while classification is still running. Completion is logged inside
+    // that closure so handler cancellation cannot erase the spawned task's terminal evidence.
+    // Returning the owned content avoids cloning it before the later audit-persistence boundary.
+    let (content, outcome, pipeline_execution_ms) = match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let execution_started = Instant::now();
+        let outcome = pipeline::assess(&content, &pipeline_state.ruleset);
+        let execution_elapsed_ms = duration_ms(execution_started);
+        tracing::info!(
+            request_id = %pipeline_task_request_id,
+            stage = "assessment_pipeline_dispatch",
+            pipeline_parallelism = pipeline_state.pipeline_parallelism,
+            wait_elapsed_ms = pipeline_wait_ms,
+            task_elapsed_ms = duration_ms(pipeline_task_started),
+            execution_elapsed_ms,
+            "assessment pipeline task completed"
+        );
+        (content, outcome, execution_elapsed_ms)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(
+                request_id = %pipeline_request_id,
+                stage = "assessment_pipeline_dispatch",
+                reason = INTERNAL_ERROR,
+                pipeline_parallelism = state.pipeline_parallelism,
+                wait_elapsed_ms = pipeline_wait_ms,
+                task_elapsed_ms = duration_ms(pipeline_task_started),
+                task_cancelled = error.is_cancelled(),
+                task_panicked = error.is_panic(),
+                operation_elapsed_ms = duration_ms(operation_started),
+                error = %error,
+                "assessment terminal error ready"
+            );
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                INTERNAL_ERROR,
+                Some(pipeline_request_id),
+            ));
+        }
+    };
     let finding_counts = finding_counts(&outcome.findings);
     let rule_ids = unique_rule_ids(&outcome.findings);
     tracing::info!(
@@ -199,7 +275,7 @@ pub(crate) async fn assess(
         rule_ids = ?rule_ids,
         redaction_span_count = outcome.redaction_span_count,
         rescan_clean = outcome.rescan_clean,
-        elapsed_ms = duration_ms(pipeline_started),
+        elapsed_ms = pipeline_execution_ms,
         "assessment pipeline completed"
     );
 
@@ -212,7 +288,7 @@ pub(crate) async fn assess(
         created_at_ms,
         verdict: outcome.verdict,
         content_sha256,
-        content: payload.content,
+        content,
         sanitized_sha256,
         sanitized_content,
         ruleset_version: state.ruleset.version.clone(),
@@ -264,6 +340,7 @@ pub(crate) async fn assess(
                 task_panicked = error.is_panic(),
                 elapsed_ms = duration_ms(persistence_started),
                 operation_elapsed_ms = duration_ms(operation_started),
+                error = %error,
                 "assessment terminal error ready"
             );
             return Err(ApiError::new(
@@ -289,15 +366,33 @@ pub(crate) async fn assess(
         findings: record.findings,
         ruleset_version: record.ruleset_version,
     };
+    let operation_elapsed_ms = duration_ms(operation_started);
+    let verdict = verdict_name(response.verdict);
     tracing::info!(
         request_id = %response.request_id,
         stage = "assessment_response_handoff",
         status = StatusCode::OK.as_u16(),
-        verdict = verdict_name(response.verdict),
+        verdict,
         socket_delivery = "unknown_after_transport_handoff",
-        elapsed_ms = duration_ms(operation_started),
+        elapsed_ms = operation_elapsed_ms,
         "assessment result ready and handed to the HTTP transport"
     );
+    // Console output is a concise terminal summary of the persisted backend outcome; the durable
+    // handoff record above remains authoritative and explicitly leaves socket delivery unknown.
+    let console_message = format!(
+        "{} request_id={} status={} verdict={} findings={} elapsed_ms={}",
+        verdict.to_ascii_uppercase(),
+        response.request_id,
+        StatusCode::OK.as_u16(),
+        verdict,
+        response.findings.len(),
+        operation_elapsed_ms
+    );
+    match response.verdict {
+        Verdict::Safe => logging::console_info(console_message),
+        Verdict::Sanitized => logging::console_warn(console_message),
+        Verdict::Unsafe => logging::console_error(console_message),
+    }
 
     Ok(Json(response))
 }

@@ -3,6 +3,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
+use crate::logging::{console_error, console_warn};
+
 /// Identifies a request whose bearer credential is missing or invalid.
 pub(crate) const UNAUTHORIZED: &str = "unauthorized";
 /// Identifies JSON that cannot be parsed into the strict assessment request shape.
@@ -196,6 +198,20 @@ impl IntoResponse for ApiError {
             socket_delivery = "unknown_after_transport_handoff",
             "error response ready and handed to the HTTP transport"
         );
+        // Only assessment errors carry request IDs; authentication reports at its boundary,
+        // while query errors intentionally remain in the durable diagnostic stream alone.
+        if let Some(request_id) = self.request_id.as_deref() {
+            let summary = format!(
+                "request_id={request_id} status={} reason={}",
+                self.status.as_u16(),
+                self.reason
+            );
+            if self.status.is_client_error() {
+                console_warn(summary);
+            } else if self.status.is_server_error() {
+                console_error(summary);
+            }
+        }
         let body = match self.query_body {
             Some(body) => CallerErrorBody::Query(body),
             None => CallerErrorBody::Basic(BasicErrorBody {

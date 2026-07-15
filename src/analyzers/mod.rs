@@ -14,8 +14,11 @@ use crate::types::{Finding, Severity, Span};
 /// Runs each enabled built-in detector in inventory order and attaches its configured metadata.
 pub(crate) fn scan(content: &str, settings: &AnalyzerSettings) -> Vec<Finding> {
     let mut findings = Vec::new();
+    let has_non_ascii = !content.is_ascii();
 
-    if settings.unicode_tags.enabled {
+    // These detectors cannot produce findings for ASCII, so avoid their Unicode scans while
+    // leaving the encoded-blob detector in its established inventory position.
+    if has_non_ascii && settings.unicode_tags.enabled {
         append_findings(
             &mut findings,
             UNICODE_TAGS_ID,
@@ -23,7 +26,7 @@ pub(crate) fn scan(content: &str, settings: &AnalyzerSettings) -> Vec<Finding> {
             unicode_tags::scan(content),
         );
     }
-    if settings.zero_width.enabled {
+    if has_non_ascii && settings.zero_width.enabled {
         append_findings(
             &mut findings,
             ZERO_WIDTH_ID,
@@ -31,7 +34,7 @@ pub(crate) fn scan(content: &str, settings: &AnalyzerSettings) -> Vec<Finding> {
             zero_width::scan(content),
         );
     }
-    if settings.bidi_override.enabled {
+    if has_non_ascii && settings.bidi_override.enabled {
         append_findings(
             &mut findings,
             BIDI_OVERRIDE_ID,
@@ -39,7 +42,7 @@ pub(crate) fn scan(content: &str, settings: &AnalyzerSettings) -> Vec<Finding> {
             bidi_override::scan(content),
         );
     }
-    if settings.mixed_script.enabled {
+    if has_non_ascii && settings.mixed_script.enabled {
         append_findings(
             &mut findings,
             MIXED_SCRIPT_ID,
@@ -59,7 +62,7 @@ pub(crate) fn scan(content: &str, settings: &AnalyzerSettings) -> Vec<Finding> {
             ),
         );
     }
-    if settings.high_nonascii.enabled {
+    if has_non_ascii && settings.high_nonascii.enabled {
         append_findings(
             &mut findings,
             HIGH_NONASCII_ID,

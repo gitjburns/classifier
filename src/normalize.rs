@@ -14,12 +14,20 @@ use unicode_normalization::{UnicodeNormalization, char::canonical_combining_clas
 
 use crate::types::Span;
 
-/// Owns normalized text and the closed segments needed to recover original byte spans.
+/// Owns normalized text and the mapping needed to recover original byte spans.
 pub struct Normalized {
     /// Contains the NFKC form consumed by pattern rules.
     pub text: String,
-    segments: Vec<Segment>,
-    original_len: usize,
+    map: NormalizationMap,
+}
+
+/// Distinguishes byte-identical ASCII from content that needs outward-rounded span recovery.
+enum NormalizationMap {
+    Identity,
+    Segmented {
+        segments: Vec<Segment>,
+        original_len: usize,
+    },
 }
 
 /// Connects one normalization-closed range in each representation.
@@ -42,45 +50,45 @@ impl Normalized {
             span.start <= span.end && span.end <= self.text.len(),
             "normalized span must be ordered and bounded by normalized text"
         );
-        if span.start == span.end {
-            let boundary = self.original_boundary(span.start);
-            return Span {
-                start: boundary,
-                end: boundary,
-            };
+        match &self.map {
+            // NFKC cannot alter ASCII, so its normalized and submitted byte offsets are identical.
+            NormalizationMap::Identity => span,
+            NormalizationMap::Segmented {
+                segments,
+                original_len,
+            } => {
+                if span.start == span.end {
+                    let boundary =
+                        original_boundary(segments, *original_len, self.text.len(), span.start);
+                    return Span {
+                        start: boundary,
+                        end: boundary,
+                    };
+                }
+
+                let start_index =
+                    segments.partition_point(|segment| segment.norm_end <= span.start);
+                let end_index =
+                    segments.partition_point(|segment| segment.norm_start < span.end) - 1;
+
+                Span {
+                    start: segments[start_index].orig_start,
+                    end: segments[end_index].orig_end,
+                }
+            }
         }
-
-        let start_index = self
-            .segments
-            .partition_point(|segment| segment.norm_end <= span.start);
-        let end_index = self
-            .segments
-            .partition_point(|segment| segment.norm_start < span.end)
-            - 1;
-
-        Span {
-            start: self.segments[start_index].orig_start,
-            end: self.segments[end_index].orig_end,
-        }
-    }
-
-    /// Maps an empty normalized span to the nearest source boundary on its left.
-    fn original_boundary(&self, normalized_offset: usize) -> usize {
-        if normalized_offset == self.text.len() {
-            return self.original_len;
-        }
-
-        let index = self
-            .segments
-            .partition_point(|segment| segment.norm_end <= normalized_offset);
-        self.segments
-            .get(index)
-            .map_or(self.original_len, |segment| segment.orig_start)
     }
 }
 
-/// Normalizes content while retaining segments that tile both byte representations.
+/// Copies byte-identical ASCII once and otherwise retains normalization-closed span segments.
 pub fn normalize(original: &str) -> Normalized {
+    if original.is_ascii() {
+        return Normalized {
+            text: original.to_owned(),
+            map: NormalizationMap::Identity,
+        };
+    }
+
     let mut text = String::new();
     let mut segments = Vec::new();
     let mut segment_start = 0;
@@ -106,9 +114,28 @@ pub fn normalize(original: &str) -> Normalized {
 
     Normalized {
         text,
-        segments,
-        original_len: original.len(),
+        map: NormalizationMap::Segmented {
+            segments,
+            original_len: original.len(),
+        },
     }
+}
+
+/// Maps an empty normalized span to the nearest source boundary on its left.
+fn original_boundary(
+    segments: &[Segment],
+    original_len: usize,
+    normalized_len: usize,
+    normalized_offset: usize,
+) -> usize {
+    if normalized_offset == normalized_len {
+        return original_len;
+    }
+
+    let index = segments.partition_point(|segment| segment.norm_end <= normalized_offset);
+    segments
+        .get(index)
+        .map_or(original_len, |segment| segment.orig_start)
 }
 
 /// Accepts a boundary only when later normalization cannot compose across it.

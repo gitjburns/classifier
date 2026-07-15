@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use serde::Deserialize;
 
 use crate::types::Severity;
@@ -122,11 +122,13 @@ pub struct CompiledRuleset {
     pub version: String,
     /// Contains every compiled data-driven pattern in file order.
     pub patterns: Vec<CompiledPattern>,
+    /// Rejects normalized content that cannot match any pattern before exact span scans.
+    pub pattern_prefilter: RegexSet,
     /// Contains explicit settings for every analyzer known to the binary.
     pub analyzers: AnalyzerSettings,
 }
 
-/// Preserves the file, rule id, and source failure for fatal rules startup diagnostics.
+/// Preserves the file, available pattern identity, and source failure for startup diagnostics.
 #[derive(Debug)]
 pub enum RulesError {
     /// Retains the OS failure encountered while reading the configured rules path.
@@ -141,6 +143,14 @@ pub enum RulesError {
         path: PathBuf,
         analyzer_id: &'static str,
     },
+    /// Identifies an analyzer tuning value outside its finite semantic domain.
+    InvalidAnalyzerSetting {
+        path: PathBuf,
+        analyzer_id: &'static str,
+        setting: &'static str,
+        value: f64,
+        required_range: &'static str,
+    },
     /// Identifies two pattern entries competing for the same finding id.
     DuplicatePatternId { path: PathBuf, rule_id: String },
     /// Prevents a pattern from impersonating a built-in analyzer in audit records.
@@ -151,6 +161,8 @@ pub enum RulesError {
         rule_id: String,
         source: regex::Error,
     },
+    /// Preserves the aggregate compiler failure after every individual pattern is valid.
+    CompileRegexSet { path: PathBuf, source: regex::Error },
 }
 
 impl CompiledRuleset {
@@ -193,6 +205,17 @@ impl fmt::Display for RulesError {
                 "rules file {} is missing required analyzer section {analyzer_id:?}",
                 path.display()
             ),
+            Self::InvalidAnalyzerSetting {
+                path,
+                analyzer_id,
+                setting,
+                value,
+                required_range,
+            } => write!(
+                formatter,
+                "rules file {} analyzer {analyzer_id:?} setting {setting:?} must be {required_range}, got {value:?}",
+                path.display()
+            ),
             Self::DuplicatePatternId { path, rule_id } => write!(
                 formatter,
                 "rules file {} contains duplicate pattern id {rule_id:?}",
@@ -212,6 +235,11 @@ impl fmt::Display for RulesError {
                 "failed to compile pattern {rule_id:?} from rules file {}: {source}",
                 path.display()
             ),
+            Self::CompileRegexSet { path, source } => write!(
+                formatter,
+                "failed to compile pattern prefilter from rules file {}: {source}",
+                path.display()
+            ),
         }
     }
 }
@@ -222,8 +250,11 @@ impl Error for RulesError {
         match self {
             Self::ReadRules { source, .. } => Some(source),
             Self::ParseRules { source, .. } => Some(source),
-            Self::CompileRegex { source, .. } => Some(source),
+            Self::CompileRegex { source, .. } | Self::CompileRegexSet { source, .. } => {
+                Some(source)
+            }
             Self::MissingAnalyzer { .. }
+            | Self::InvalidAnalyzerSetting { .. }
             | Self::DuplicatePatternId { .. }
             | Self::AnalyzerIdCollision { .. } => None,
         }
@@ -242,8 +273,21 @@ impl RulesFile {
     /// Converts the parsed file only after all required sections and shared ids are valid.
     fn compile(self, path: &Path) -> Result<CompiledRuleset, RulesError> {
         let analyzers = self.analyzer.require_all(path)?;
+        // A density ratio is meaningful only on the closed unit interval. Enforcing that domain at
+        // load time also makes the ASCII analyzer fast path behavior-equivalent for every ruleset.
+        let max_ratio = analyzers.high_nonascii.max_ratio;
+        if !max_ratio.is_finite() || !(0.0..=1.0).contains(&max_ratio) {
+            return Err(RulesError::InvalidAnalyzerSetting {
+                path: path.to_path_buf(),
+                analyzer_id: HIGH_NONASCII_ID,
+                setting: "max_ratio",
+                value: max_ratio,
+                required_range: "a finite number within 0.0..=1.0",
+            });
+        }
         let mut pattern_ids = HashSet::with_capacity(self.pattern.len());
         let mut patterns = Vec::with_capacity(self.pattern.len());
+        let mut pattern_sources = Vec::with_capacity(self.pattern.len());
 
         for pattern in self.pattern {
             if ANALYZER_IDS.contains(&pattern.id.as_str()) {
@@ -271,11 +315,21 @@ impl RulesFile {
                 severity: pattern.severity,
                 regex,
             });
+            pattern_sources.push(pattern.regex);
         }
+
+        // Aggregate compilation follows every per-pattern check so existing validation order and
+        // rule-specific regex diagnostics remain authoritative.
+        let pattern_prefilter =
+            RegexSet::new(&pattern_sources).map_err(|source| RulesError::CompileRegexSet {
+                path: path.to_path_buf(),
+                source,
+            })?;
 
         Ok(CompiledRuleset {
             version: self.version,
             patterns,
+            pattern_prefilter,
             analyzers,
         })
     }

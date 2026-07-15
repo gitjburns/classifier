@@ -41,6 +41,33 @@ async fn main() -> ExitCode {
         "configuration loaded and service logging initialized"
     );
 
+    // Concurrency is fixed before serving so every request observes the same CPU-work bound.
+    let pipeline_parallelism_started = Instant::now();
+    tracing::info!(
+        stage = "pipeline_parallelism",
+        "classification pipeline parallelism detection started"
+    );
+    let pipeline_parallelism = match std::thread::available_parallelism() {
+        Ok(parallelism) => parallelism.get(),
+        Err(error) => {
+            tracing::error!(
+                target: logging::PROCESS_ERROR_TARGET,
+                stage = "pipeline_parallelism",
+                elapsed_ms = elapsed_ms(pipeline_parallelism_started),
+                error = %error,
+                "fatal startup error"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(
+        stage = "pipeline_parallelism",
+        pipeline_parallelism,
+        elapsed_ms = elapsed_ms(pipeline_parallelism_started),
+        "classification pipeline parallelism configured"
+    );
+    let pipeline_permits = Arc::new(tokio::sync::Semaphore::new(pipeline_parallelism));
+
     // The token stays in memory only; diagnostics expose its path, never its value. Duration
     // conversion saturates so even an extreme uptime cannot make error reporting fail.
     let token_load_started = Instant::now();
@@ -54,6 +81,7 @@ async fn main() -> ExitCode {
         Err(error) => {
             let token_elapsed_ms = elapsed_ms(token_load_started);
             tracing::error!(
+                target: logging::PROCESS_ERROR_TARGET,
                 stage = "token_load",
                 elapsed_ms = token_elapsed_ms,
                 error = %error,
@@ -82,6 +110,7 @@ async fn main() -> ExitCode {
         Err(error) => {
             let rules_elapsed_ms = elapsed_ms(rules_load_started);
             tracing::error!(
+                target: logging::PROCESS_ERROR_TARGET,
                 stage = "rules_load",
                 rules_path = %config.rules.path.display(),
                 elapsed_ms = rules_elapsed_ms,
@@ -107,6 +136,7 @@ async fn main() -> ExitCode {
         Ok(limit) => limit,
         Err(error) => {
             tracing::error!(
+                target: logging::PROCESS_ERROR_TARGET,
                 stage = "audit_store_bounds",
                 error = %error,
                 "fatal startup error"
@@ -136,6 +166,7 @@ async fn main() -> ExitCode {
         Err(error) => {
             let store_elapsed_ms = elapsed_ms(store_open_started);
             tracing::error!(
+                target: logging::PROCESS_ERROR_TARGET,
                 stage = "audit_store_open",
                 database_path = %config.database.path.display(),
                 elapsed_ms = store_elapsed_ms,
@@ -157,6 +188,8 @@ async fn main() -> ExitCode {
     let bind_addr = config.server.bind_addr;
     let state = Arc::new(http::AppState {
         config,
+        pipeline_parallelism,
+        pipeline_permits,
         request_body_limit,
         token,
         ruleset,
@@ -177,6 +210,7 @@ async fn main() -> ExitCode {
         Ok(signals) => signals,
         Err(error) => {
             tracing::error!(
+                target: logging::PROCESS_ERROR_TARGET,
                 stage = "shutdown_signal_registration",
                 elapsed_ms = elapsed_ms(signal_registration_started),
                 error = %error,
@@ -203,6 +237,7 @@ async fn main() -> ExitCode {
         Ok(listener) => listener,
         Err(error) => {
             tracing::error!(
+                target: logging::PROCESS_ERROR_TARGET,
                 stage = "http_bind",
                 bind_addr = %bind_addr,
                 elapsed_ms = elapsed_ms(bind_started),
@@ -248,6 +283,7 @@ async fn main() -> ExitCode {
         }
         Err(error) => {
             tracing::error!(
+                target: logging::PROCESS_ERROR_TARGET,
                 stage = "http_serve",
                 bind_addr = %bind_addr,
                 elapsed_ms = elapsed_ms(serving_started),
@@ -287,6 +323,7 @@ fn log_shutdown_trigger(signal: &'static str, received: Option<()>) {
         tracing::info!(stage = "shutdown", signal, "graceful shutdown started");
     } else {
         tracing::error!(
+            target: logging::PROCESS_ERROR_TARGET,
             stage = "shutdown",
             signal,
             "shutdown signal stream closed; graceful shutdown forced"
@@ -304,6 +341,7 @@ async fn shutdown_signal() {
             "graceful shutdown started"
         ),
         Err(error) => tracing::error!(
+            target: logging::PROCESS_ERROR_TARGET,
             stage = "shutdown",
             signal = "ctrl-c",
             error = %error,

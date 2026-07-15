@@ -47,15 +47,15 @@ current implementation:
 |---|---|
 | `src/main.rs` | Ordered startup, immutable application-state assembly, listener binding, readiness, signal registration, serving, and graceful shutdown. |
 | `src/config.rs` | Strict typed TOML configuration, command-line parsing, derived body-limit validation, query-bound validation, and bearer-token loading. |
-| `src/logging.rs` | Matching stderr and synchronous append-only file tracing layers. |
-| `src/rules.rs` | Strict rules-file parsing, analyzer-setting validation, rule-ID validation, regular-expression compilation, and atomic `CompiledRuleset` construction. |
-| `src/analyzers/` | Six pure original-text analyzers that return UTF-8 byte spans. |
-| `src/normalize.rs` | NFKC normalization plus outward-rounding translation from normalized spans to original byte spans. |
+| `src/logging.rs` | Concise terminal outcomes, fatal-process stderr routing, and complete configured-level lifecycle tracing to the synchronous append-only file. |
+| `src/rules.rs` | Strict rules-file parsing, analyzer-setting validation, rule-ID validation, individual regular-expression and candidate-set compilation, and atomic `CompiledRuleset` construction. |
+| `src/analyzers/` | Six pure original-text analyzers that return UTF-8 byte spans, with Unicode-only scans skipped for ASCII input. |
+| `src/normalize.rs` | ASCII identity handling, NFKC normalization, and outward-rounding translation from normalized spans to original byte spans. |
 | `src/pipeline.rs` | Pure assessment, finding collection, verdict selection, redaction, and one complete re-assessment. |
 | `src/types.rs` | Single definitions of `Severity`, `Verdict`, `Finding`, and `Span`. |
-| `src/store.rs` | The sole transactional writer, bounded read-only history access, schema verification, cursor encoding, and stored-value validation. |
+| `src/store.rs` | The sole transactional writer with writer-wait diagnostics, bounded read-only history access, schema verification, cursor encoding, and stored-value validation. |
 | `src/http/auth.rs` | Bearer authentication for every route except health. |
-| `src/http/assess.rs` | Assessment operation identity, strict request validation, pipeline invocation, blocking persistence boundary, and response shaping. |
+| `src/http/assess.rs` | Assessment operation identity, strict request validation, bounded blocking-pipeline dispatch, blocking persistence boundary, and response shaping. |
 | `src/http/query.rs` | Strict list-filter validation, blocking history reads, keyset pagination, detail retrieval, and RFC 3339 timestamp rendering. |
 | `src/http/error.rs` | Stable basic errors, typed corrective query errors, and response-handoff diagnostics. |
 | `src/http/mod.rs` | Route composition, shared state, body-limit placement, and readiness health response. |
@@ -70,14 +70,18 @@ After startup, handlers share one `Arc<AppState>` containing:
 - the validated configuration;
 - the derived HTTP request-body cap;
 - the bearer token loaded into memory;
-- one fully compiled, immutable ruleset; and
-- one `Store` containing the sole writer connection and read-path limits.
+- one fully compiled, immutable ruleset;
+- one `Store` containing the sole writer connection and read-path limits;
+- the CPU parallelism detected during startup; and
+- a semaphore with that many classification permits.
 
 The `Arc` expresses intentional process-wide ownership. The ruleset, token, and
 configuration do not change while the process runs. The store protects its one
 writer connection with a mutex because all successful assessments serialize
 through the single audit transaction path. Read operations do not share that
-connection; each opens an isolated read-only connection.
+connection; each opens an isolated read-only connection. The semaphore bounds
+concurrent deterministic-pipeline work independently of the number of HTTP or
+blocking-pool tasks.
 
 ## Startup and readiness
 
@@ -86,7 +90,8 @@ Startup follows one ordered path:
 ```text
 arguments
   -> strict configuration
-  -> stderr + file logging
+  -> concise stderr + durable file logging routes
+  -> available-CPU detection and classification semaphore
   -> bearer token
   -> complete ruleset parse and compilation
   -> audit writer open and schema verification
@@ -99,7 +104,8 @@ arguments
 
 Argument and configuration failures occur before a configured logger exists and
 are reported to stderr. Once logging initializes, later fatal startup errors are
-written through both tracing layers.
+written to stderr and the durable file. Nonfatal startup lifecycle records go to
+the file at the configured level.
 
 The process does not publish readiness until every dependency is usable and the
 listener has bound. Because the health route is reachable only through the
@@ -123,13 +129,17 @@ The loader uses `deny_unknown_fields` throughout. It rejects:
 - an unknown key or analyzer ID;
 - an omitted analyzer section, even when the operator intended it to be off;
 - duplicate pattern IDs;
-- a pattern ID colliding with a built-in analyzer ID; or
+- a pattern ID colliding with a built-in analyzer ID;
+- a non-finite `high-nonascii.max_ratio` or one outside `0.0..=1.0`; or
 - any regular expression that does not compile.
 
 The complete file is validated and compiled before a `CompiledRuleset` exists,
 so requests cannot observe a partially loaded inventory. Pattern matching uses
 Rust's finite-automaton `regex` implementation, preserving linear-time behavior
-over bounded untrusted input.
+over bounded untrusted input. Compilation also builds a `RegexSet` from the same
+pattern sources. At assessment time the set selects candidate pattern indices;
+the corresponding individual regular expressions remain authoritative for
+repeated matches and exact spans, in rules-file order.
 
 The shipped built-in analyzers are:
 
@@ -156,6 +166,11 @@ compatibility forms, styled characters, and composed/decomposed equivalents can
 match one signature. Case handling belongs to each regular expression; the
 pipeline does not case-fold the whole input.
 
+For all-ASCII input, normalization copies the bytes once and uses identity span
+translation. The analyzer dispatcher skips only the Unicode-specific analyzers,
+which cannot produce ASCII findings; the encoded-blob analyzer still runs in its
+inventory position. These paths preserve the same evidence and ordering rules.
+
 Full-string normalization cannot be mapped character by character because
 composition can cross input-character boundaries. `normalize.rs` instead divides
 the original into normalization-closed segments. Concatenating the NFKC result
@@ -175,13 +190,15 @@ authenticated POST /v1/assess
   -> enforce bounded JSON body and strict request shape
   -> reject empty or oversized content
   -> compute SHA-256 and require exact lowercase caller match
-  -> run pure deterministic pipeline
+  -> wait for one startup-sized classification permit
+  -> dispatch pure deterministic pipeline through spawn_blocking
        -> original-text analyzers
        -> NFKC normalization and normalized-text patterns
        -> original-byte findings ordered by span start
        -> verdict decision
        -> optional redaction and one complete re-assessment
-  -> cross spawn_blocking boundary
+  -> release the owned permit when the blocking task finishes
+  -> dispatch synchronous audit persistence through spawn_blocking
   -> commit assessment + initial findings in one SQLite transaction
   -> return the committed verdict and evidence
 ```
@@ -203,6 +220,11 @@ is never truncated.
 The caller's lowercase SHA-256 must exactly equal the service's digest of the
 decoded content's UTF-8 bytes. This integrity check binds the verdict and every
 finding span to the same bytes the caller intended to submit.
+
+The handler acquires an owned classification permit before dispatch. That permit
+moves into the non-cancellable blocking closure, so cancellation of the handler
+does not advertise CPU capacity while its pipeline work is still running. Permit
+wait and pipeline execution are recorded separately in lifecycle diagnostics.
 
 ### Verdict and sanitization
 
@@ -241,11 +263,13 @@ operator to `init-db` rather than modifying the database.
 
 Before beginning a write, the store validates field sizes, UUID shape, timestamp
 and duration representations, finding count, and that every span is ordered and
-contained in the original content. It then inserts the assessment and all
-findings in one transaction. Only a confirmed commit permits an HTTP verdict.
-A normal persistence error reports `audit_persistence_failed`; a blocking-task
-join failure reports `audit_status_unknown` because commit state cannot safely
-be claimed.
+contained in the original content. It measures time spent waiting for the sole
+writer mutex and attaches that duration to the transaction-begin record; mutex
+poisoning remains an explicit writer-lock error. It then inserts the assessment
+and all findings in one transaction. Only a confirmed commit permits an HTTP
+verdict. A normal persistence error reports `audit_persistence_failed`; a
+blocking-task join failure reports `audit_status_unknown` because commit state
+cannot safely be claimed.
 
 ## History query flow
 
@@ -277,9 +301,11 @@ terminal outcome are recorded as their own diagnostic operation.
 
 Tokio owns naturally asynchronous work: the server, HTTP request extraction,
 transport response handoff, signal handling, and blocking-task coordination.
-The deterministic pipeline remains synchronous and runs inline in the handler.
-Its input is byte-capped and its regex engine is linear-time, so moving it to a
-blocking pool would add coordination without isolating blocking I/O.
+The deterministic pipeline remains a synchronous, framework-independent
+function, but assessment handlers dispatch it through `spawn_blocking` so CPU
+work does not occupy Tokio workers. A startup-sized semaphore bounds concurrent
+pipeline tasks to the host's detected available parallelism. Its owned permits
+remain in their blocking closures through handler cancellation.
 
 `rusqlite` remains synchronous. Assessment writes and history reads cross
 `tokio::task::spawn_blocking` at the HTTP call sites; `store.rs` itself contains
@@ -288,20 +314,27 @@ blocking Tokio worker threads.
 
 ## Diagnostics
 
-`logging.rs` installs two tracing layers with the configured level: stderr and a
-synchronous line-buffered file opened in append mode. The file path's parent
-must exist. There is no asynchronous logging worker or lossy queue between an
-event and the shared file writer.
+`logging.rs` separates three output roles. A message-only stderr layer emits one
+concise line for each assessment outcome or authentication failure: `safe` is an
+unstyled `INFO` event, `sanitized` and caller-correctable rejections are yellow
+`WARN`, and `unsafe` and internal failures are bold-red `ERROR`. ANSI styling is
+enabled only when stderr is a terminal. A second stderr layer retains formatted
+fatal process errors. The third layer is the synchronous line-buffered file
+opened in append mode; it records complete lifecycle evidence at the configured
+level and explicitly excludes the derived console-only summaries. Its parent
+directory must exist. There is no asynchronous logging worker or lossy queue
+between a lifecycle event and the shared file writer.
 
 Diagnostics cover:
 
 - startup stages, failure boundaries, listener binding, readiness, and shutdown;
-- assessment acceptance, validation, pipeline summary, redaction/re-scan state,
-  audit transaction phases, terminal result, and transport handoff;
+- assessment acceptance, validation, classification-permit wait, pipeline
+  execution and summary, redaction/re-scan state, audit transaction phases,
+  terminal result, and transport handoff;
 - list/detail acceptance, safe filter facts, read outcome, caps, elapsed time,
   terminal result, and transport handoff; and
-- SQLite begin, row insertion, findings insertion, commit, and local source
-  errors.
+- SQLite writer-mutex wait, begin, row insertion, findings insertion, commit,
+  and local source errors.
 
 The HTTP stack can confirm that a response was constructed and handed to the
 transport, but it cannot reliably prove socket-level delivery afterward. Logs
@@ -326,7 +359,8 @@ detail retrieval intentionally returns content and must be treated accordingly.
 
 ## Intentional limitations
 
-- `safe` means no enabled deterministic signal matched; it is not proof that the
+- `safe` means no enabled critical or suspect deterministic signal matched;
+  advisory findings may still be present, and the verdict is not proof that the
   text is harmless.
 - Encoded segments are detected and optionally redacted but never decoded or
   recursively inspected.
