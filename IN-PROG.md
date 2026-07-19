@@ -5,7 +5,7 @@
 Please read:
 
 SPEC.md
-PLAN.md
+PLAN-optimizations.md
 
 If there are any unexpected inconsistencies in this file, let the user know before continuing.
 

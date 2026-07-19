@@ -7,6 +7,10 @@ edition = "2024"
 name = "init-db"
 path = "src/bin/init_db.rs"
 
+[[bin]]
+name = "bench-load"
+path = "src/bin/bench_load.rs"
+
 [dependencies]
 axum = "0.8.9"
 hex = "0.4.3"
