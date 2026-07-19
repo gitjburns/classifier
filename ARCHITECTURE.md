@@ -53,7 +53,7 @@ current implementation:
 | `src/normalize.rs` | ASCII identity handling, NFKC normalization, and outward-rounding translation from normalized spans to original byte spans. |
 | `src/pipeline.rs` | Pure assessment, finding collection, verdict selection, redaction, and one complete re-assessment. |
 | `src/types.rs` | Single definitions of `Severity`, `Verdict`, `Finding`, and `Span`. |
-| `src/store.rs` | The sole transactional writer with writer-wait diagnostics, bounded read-only history access, schema verification, cursor encoding, and stored-value validation. |
+| `src/store.rs` | The dedicated audit-writer thread committing batched single-fsync transactions, bounded read-only history access, schema and journal-mode verification, cursor encoding, and stored-value validation. |
 | `src/http/auth.rs` | Bearer authentication for every route except health. |
 | `src/http/assess.rs` | Assessment operation identity, strict request validation, bounded blocking-pipeline dispatch, blocking persistence boundary, and response shaping. |
 | `src/http/query.rs` | Strict list-filter validation, blocking history reads, keyset pagination, detail retrieval, and RFC 3339 timestamp rendering. |
@@ -71,15 +71,19 @@ After startup, handlers share one `Arc<AppState>` containing:
 - the derived HTTP request-body cap;
 - the bearer token loaded into memory;
 - one fully compiled, immutable ruleset;
-- one `Store` containing the sole writer connection and read-path limits;
+- one `Store` containing the bounded queue to the audit-writer thread and
+  read-path limits;
 - the CPU parallelism detected during startup; and
 - a semaphore with that many classification permits.
 
 The `Arc` expresses intentional process-wide ownership. The ruleset, token, and
-configuration do not change while the process runs. The store protects its one
-writer connection with a mutex because all successful assessments serialize
-through the single audit transaction path. Read operations do not share that
-connection; each opens an isolated read-only connection. The semaphore bounds
+configuration do not change while the process runs. The sole writer connection
+lives on a dedicated thread spawned at startup; the store's bounded queue is
+the only runtime path to it, so the single-write-path invariant is structural.
+The thread drains whatever requests accumulated while the previous transaction
+ran and commits them as one batch, sharing a single fsync; an idle service
+commits batches of one and adds no latency. Read operations do not touch that
+thread; each opens an isolated read-only connection. The semaphore bounds
 concurrent deterministic-pipeline work independently of the number of HTTP or
 blocking-pool tasks.
 
@@ -206,9 +210,10 @@ authenticated POST /v1/assess
        -> verdict decision
        -> optional redaction and one complete re-assessment
   -> release the owned permit when the blocking task finishes
-  -> dispatch synchronous audit persistence through spawn_blocking
-  -> commit assessment + initial findings in one SQLite transaction
-  -> return the committed verdict and evidence
+  -> queue the validated record for the dedicated audit writer
+  -> commit assessment + initial findings with the writer's current batch
+     in one SQLite transaction sharing one fsync
+  -> return the verdict only after that batch's durable commit confirmation
 ```
 
 Authentication occurs before the handler assigns a `request_id`. Missing,
@@ -269,15 +274,17 @@ permission. Startup prepares statements against the expected columns and checks
 all required indexes. Missing or incompatible state is fatal and points the
 operator to `init-db` rather than modifying the database.
 
-Before beginning a write, the store validates field sizes, UUID shape, timestamp
-and duration representations, finding count, and that every span is ordered and
-contained in the original content. It measures time spent waiting for the sole
-writer mutex and attaches that duration to the transaction-begin record; mutex
-poisoning remains an explicit writer-lock error. It then inserts the assessment
-and all findings in one transaction. Only a confirmed commit permits an HTTP
-verdict. A normal persistence error reports `audit_persistence_failed`; a
-blocking-task join failure reports `audit_status_unknown` because commit state
-cannot safely be claimed.
+Before enqueueing a write, the store validates field sizes, UUID shape,
+timestamp and duration representations, finding count, and that every span is
+ordered and contained in the original content. The validated record then joins
+the dedicated writer thread's current batch: all members' rows and findings are
+inserted in one transaction whose single commit fsync they share, and each
+waiting handler receives the batch sequence only after that durable commit.
+Batches fail atomically — every member receives the shared cause and per-member
+failure records keep local identifiers. Only a confirmed commit permits an HTTP
+verdict. A normal persistence error reports `audit_persistence_failed`; a lost
+confirmation (the writer died between enqueue and commit) reports
+`audit_status_unknown` because commit state cannot safely be claimed.
 
 ## History query flow
 
@@ -315,10 +322,12 @@ work does not occupy Tokio workers. A startup-sized semaphore bounds concurrent
 pipeline tasks to the host's detected available parallelism. Its owned permits
 remain in their blocking closures through handler cancellation.
 
-`rusqlite` remains synchronous. Assessment writes and history reads cross
-`tokio::task::spawn_blocking` at the HTTP call sites; `store.rs` itself contains
-no async facade. This makes the boundary visible and prevents SQLite work from
-blocking Tokio worker threads.
+`rusqlite` remains synchronous. History reads cross `tokio::task::spawn_blocking`
+at the HTTP call sites. Assessment persistence crosses a bounded channel to the
+dedicated audit-writer thread, where all SQLite write work stays synchronous;
+the handler's only async work is awaiting the durable-commit confirmation.
+Both boundaries are explicit and prevent SQLite work from blocking Tokio worker
+threads.
 
 ## Diagnostics
 
@@ -342,8 +351,10 @@ Diagnostics cover:
   terminal result, and transport handoff;
 - list/detail acceptance, safe filter facts, read outcome, caps, elapsed time,
   terminal result, and transport handoff; and
-- SQLite writer-mutex wait, begin, row insertion, findings insertion, commit,
-  and local source errors.
+- one consolidated record per committed audit batch (batch sequence, batch
+  size, begin, insertion, and commit durations), per-member failure records
+  with local identifiers, and local source errors; each request's terminal
+  record cites its committing batch sequence.
 
 The HTTP stack can confirm that a response was constructed and handed to the
 transport, but it cannot reliably prove socket-level delivery afterward. Logs

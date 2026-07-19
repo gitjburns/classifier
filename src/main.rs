@@ -175,14 +175,14 @@ async fn main() -> ExitCode {
         query_max_findings_per_assessment = config.query.max_findings_per_assessment,
         "audit store open and schema verification started"
     );
-    let store = match store::Store::open(
+    let (store, audit_writer) = match store::Store::open(
         &config.database.path,
         config.query.timeout_ms,
         config.query.max_limit,
         config.query.max_findings_per_assessment,
         request_body_limit,
     ) {
-        Ok(store) => store,
+        Ok(pair) => pair,
         Err(error) => {
             let store_elapsed_ms = elapsed_ms(store_open_started);
             tracing::error!(
@@ -295,17 +295,34 @@ async fn main() -> ExitCode {
     let shutdown = shutdown_signal(shutdown_signals);
     #[cfg(not(unix))]
     let shutdown = shutdown_signal();
-    match axum::serve(listener, app)
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
-        .await
-    {
+        .await;
+    // Serving only returns after every in-flight handler finished, so all queued audit work has
+    // been answered and the router's state drop released the last queue sender. Joining here
+    // guarantees the writer's drain-and-exit completed before the process reports shutdown.
+    let writer_result = audit_writer.join();
+    match &writer_result {
+        Ok(()) => tracing::info!(stage = "shutdown", "audit writer thread drained and exited"),
+        Err(_) => tracing::error!(
+            target: logging::PROCESS_ERROR_TARGET,
+            stage = "shutdown",
+            error = "audit writer thread panicked",
+            "audit writer thread did not exit cleanly"
+        ),
+    }
+    match serve_result {
         Ok(()) => {
             tracing::info!(
                 stage = "shutdown",
                 elapsed_ms = elapsed_ms(serving_started),
                 "graceful shutdown completed"
             );
-            ExitCode::SUCCESS
+            if writer_result.is_ok() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
         }
         Err(error) => {
             tracing::error!(

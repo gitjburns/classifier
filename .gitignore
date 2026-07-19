@@ -4,3 +4,4 @@ secrets/
 config.toml
 logs/
 data/
+bench/trash

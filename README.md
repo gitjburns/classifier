@@ -127,10 +127,12 @@ Run the initializer once, after the configured database parent directory exists:
 ./target/release/init-db --config config.toml
 ```
 
-The initializer applies `db/schema.sql` in one transaction. It refuses to modify
-a database that already contains the `assessments` table. Schema changes and
-data migrations are deliberate operator actions; the service runtime never
-creates or alters schema.
+The initializer sets the persistent database-file properties (4096-byte pages
+and WAL journal mode), then applies `db/schema.sql` in one transaction. It
+refuses to modify a database that already contains the `assessments` table.
+Schema changes and data migrations are deliberate operator actions; the service
+runtime verifies — never sets — the journal mode, and never creates or alters
+schema.
 
 When developing without a release build, the equivalent command is:
 
@@ -231,8 +233,10 @@ the log file can be opened are available there only.
 Diagnostics contain safe identifiers, hashes, counts, limits, statuses, and
 elapsed times; they do not contain submitted content, full prompts, model output,
 bearer tokens, or cursor values. Assessment dispatch records permit-wait and
-pipeline-execution timing. Audit transaction-begin records include time spent
-waiting for the sole SQLite writer mutex.
+pipeline-execution timing. Audit persistence is committed in batches by a
+dedicated writer thread: one consolidated record per batch carries its size and
+per-phase durations, and each assessment's terminal record cites its committing
+batch sequence.
 
 Common startup failures:
 

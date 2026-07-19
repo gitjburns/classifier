@@ -2,11 +2,13 @@ use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::string::FromUtf8Error;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params, params_from_iter};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::types::{Finding, Severity, Span, Verdict};
 
@@ -41,15 +43,31 @@ const SELECT_FINDINGS_SQL: &str = "SELECT rule_id, severity, span_start, span_en
 FROM findings WHERE request_id = ?1 ORDER BY span_start, span_end, rowid LIMIT ?2";
 const REQUIRED_INDEX_COUNT: i64 = 4;
 const PROGRESS_HANDLER_INSTRUCTION_INTERVAL: i32 = 1_000;
+// Queue capacity bounds handler backpressure; the batch cap bounds worst-case batch latency and
+// the size of an atomic batch failure. Both are writer-throughput tuning, not correctness limits.
+const PERSIST_QUEUE_CAPACITY: usize = 1_024;
+const MAX_PERSIST_BATCH: usize = 128;
 
-/// Owns the sole audit writer and the bounds applied to every read-only query connection.
+/// Owns the queue feeding the dedicated audit-writer thread and the bounds applied to every
+/// read-only query connection. The writer connection itself lives on that thread; this sender
+/// is the only runtime path to it, making the single-write-path invariant structural.
 pub struct Store {
     path: PathBuf,
-    writer: Mutex<Connection>,
+    persist_tx: mpsc::Sender<PersistRequest>,
     query_timeout: Duration,
     max_query_rows: usize,
     max_findings_per_assessment: usize,
     max_cell_bytes: usize,
+}
+
+/// Carries one validated assessment to the audit-writer thread together with the channel that
+/// confirms its durable batch commit; the verdict is released only after that confirmation.
+struct PersistRequest {
+    record: AssessmentRecord,
+    /// Marks enqueue time so failure records can attribute queue wait separately from commit.
+    enqueued: Instant,
+    /// Receives the committing batch sequence, or the shared cause of an atomic batch failure.
+    responder: oneshot::Sender<Result<u64, Arc<StoreError>>>,
 }
 
 /// Carries every field committed as one authoritative assessment record.
@@ -170,8 +188,18 @@ pub enum StoreError {
         detail: String,
     },
     WriterUnavailable,
-    Begin {
+    WriterSpawn {
+        source: std::io::Error,
+    },
+    WriterResponseLost {
         request_id: String,
+    },
+    Batch {
+        request_id: String,
+        source: Arc<StoreError>,
+    },
+    Begin {
+        batch_seq: u64,
         source: rusqlite::Error,
     },
     WriteAssessment {
@@ -184,7 +212,8 @@ pub enum StoreError {
         source: rusqlite::Error,
     },
     Commit {
-        request_id: String,
+        batch_seq: u64,
+        batch_size: usize,
         source: rusqlite::Error,
     },
     Query {
@@ -228,14 +257,16 @@ struct RawAssessmentRecord {
 }
 
 impl Store {
-    /// Opens existing writer and reader roles, verifies schema, and never creates runtime state.
+    /// Opens existing writer and reader roles, verifies schema, spawns the dedicated
+    /// audit-writer thread, and never creates runtime state. The returned join handle lets
+    /// shutdown wait for the writer's queue drain after the last sender drops.
     pub fn open(
         path: &Path,
         query_timeout_ms: u64,
         max_query_rows: usize,
         max_findings_per_assessment: usize,
         max_cell_bytes: usize,
-    ) -> Result<Self, StoreError> {
+    ) -> Result<(Self, thread::JoinHandle<()>), StoreError> {
         let query_timeout = Duration::from_millis(query_timeout_ms);
         let writer = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(
             |source| StoreError::Open {
@@ -245,6 +276,7 @@ impl Store {
             },
         )?;
         configure_writer(&writer, path, query_timeout)?;
+        verify_journal_mode(&writer, path)?;
         verify_schema(&writer, path)?;
 
         // Opening and checking the read role at startup prevents later query traffic from being
@@ -252,173 +284,65 @@ impl Store {
         let reader = open_reader(path, query_timeout)?;
         verify_schema(&reader, path)?;
 
-        Ok(Self {
-            path: path.to_path_buf(),
-            writer: Mutex::new(writer),
-            query_timeout,
-            max_query_rows,
-            max_findings_per_assessment,
-            max_cell_bytes,
-        })
+        // The verified writer connection moves permanently onto its dedicated thread; from here
+        // on, the bounded queue is the sole runtime write path.
+        let (persist_tx, persist_rx) = mpsc::channel(PERSIST_QUEUE_CAPACITY);
+        let writer_thread = thread::Builder::new()
+            .name("audit-writer".to_owned())
+            .spawn(move || run_audit_writer(writer, persist_rx))
+            .map_err(|source| StoreError::WriterSpawn { source })?;
+
+        Ok((
+            Self {
+                path: path.to_path_buf(),
+                persist_tx,
+                query_timeout,
+                max_query_rows,
+                max_findings_per_assessment,
+                max_cell_bytes,
+            },
+            writer_thread,
+        ))
     }
 
-    /// Persists the assessment row and all initial findings in one diagnostic transaction.
-    pub fn persist_assessment(&self, record: &AssessmentRecord) -> Result<(), StoreError> {
+    /// Validates one assessment, queues it for the dedicated audit writer, and waits for the
+    /// batch commit that makes it durable. Returns the committing batch sequence for the
+    /// caller's terminal record; the verdict is released only after this confirmation.
+    pub async fn persist_assessment(&self, record: AssessmentRecord) -> Result<u64, StoreError> {
         validate_record(
-            record,
+            &record,
             self.max_cell_bytes,
             self.max_findings_per_assessment,
         )?;
-        let elapsed_ms = i64_from_u64(record.elapsed_ms, "elapsed_ms")?;
-        // Writer contention is scheduling time, not transaction time. Carry it into the existing
-        // begin-attempt event so the normal path gains no additional synchronous log write.
-        let writer_wait_started = Instant::now();
-        let mut writer = self.lock_writer(&record.request_id, writer_wait_started)?;
-        let writer_wait_elapsed_ms = duration_ms(writer_wait_started);
-
-        let transaction_started = Instant::now();
-        let begin_started = Instant::now();
-        tracing::info!(
-            request_id = %record.request_id,
-            stage = "audit_transaction_begin",
-            writer_wait_elapsed_ms,
-            "audit transaction begin attempt"
-        );
-        let transaction = writer.transaction().map_err(|source| {
+        let request_id = record.request_id.clone();
+        let (responder, confirmation) = oneshot::channel();
+        let request = PersistRequest {
+            record,
+            enqueued: Instant::now(),
+            responder,
+        };
+        // A closed queue means shutdown already stopped the writer; nothing was committed, so
+        // this is a definite persistence failure, not an unknown outcome. A full queue simply
+        // awaits here, which is the intended backpressure on request intake.
+        if self.persist_tx.send(request).await.is_err() {
             tracing::error!(
-                request_id = %record.request_id,
-                stage = "audit_transaction_begin",
-                elapsed_ms = duration_ms(begin_started),
-                error = %source,
-                "audit transaction begin failed"
+                request_id = %request_id,
+                stage = "audit_enqueue",
+                error = "audit writer queue is closed",
+                "audit persistence rejected"
             );
-            StoreError::Begin {
-                request_id: record.request_id.clone(),
-                source,
-            }
-        })?;
-        tracing::info!(
-            request_id = %record.request_id,
-            stage = "audit_transaction_begin",
-            elapsed_ms = duration_ms(begin_started),
-            "audit transaction began"
-        );
-
-        let assessment_insert_started = Instant::now();
-        tracing::info!(
-            request_id = %record.request_id,
-            stage = "audit_assessment_insert",
-            "audit assessment row persistence started"
-        );
-        transaction
-            .execute(
-                INSERT_ASSESSMENT_SQL,
-                params![
-                    record.request_id,
-                    record.created_at_ms,
-                    verdict_name(record.verdict),
-                    record.content_sha256,
-                    record.content,
-                    record.sanitized_sha256.as_deref(),
-                    record.sanitized_content.as_deref(),
-                    record.ruleset_version,
-                    elapsed_ms,
-                ],
-            )
-            .map_err(|source| {
-                tracing::error!(
-                    request_id = %record.request_id,
-                    stage = "audit_assessment_insert",
-                    elapsed_ms = duration_ms(assessment_insert_started),
-                    error = %source,
-                    "audit assessment row persistence failed"
-                );
-                StoreError::WriteAssessment {
-                    request_id: record.request_id.clone(),
-                    source,
-                }
-            })?;
-        tracing::info!(
-            request_id = %record.request_id,
-            stage = "audit_assessment_insert",
-            elapsed_ms = duration_ms(assessment_insert_started),
-            "audit assessment row persisted"
-        );
-
-        let findings_insert_started = Instant::now();
-        tracing::info!(
-            request_id = %record.request_id,
-            finding_count = record.findings.len(),
-            stage = "audit_findings_insert",
-            "audit findings persistence started"
-        );
-        for finding in &record.findings {
-            let span_start = i64_from_usize(finding.span.start, "span_start")?;
-            let span_end = i64_from_usize(finding.span.end, "span_end")?;
-            transaction
-                .execute(
-                    INSERT_FINDING_SQL,
-                    params![
-                        record.request_id,
-                        finding.rule_id,
-                        severity_name(finding.severity),
-                        span_start,
-                        span_end,
-                    ],
-                )
-                .map_err(|source| {
-                    tracing::error!(
-                        request_id = %record.request_id,
-                        rule_id = %finding.rule_id,
-                        stage = "audit_findings_insert",
-                        elapsed_ms = duration_ms(findings_insert_started),
-                        error = %source,
-                        "audit finding persistence failed"
-                    );
-                    StoreError::WriteFinding {
-                        request_id: record.request_id.clone(),
-                        rule_id: finding.rule_id.clone(),
-                        source,
-                    }
-                })?;
+            return Err(StoreError::WriterUnavailable);
         }
-        tracing::info!(
-            request_id = %record.request_id,
-            finding_count = record.findings.len(),
-            stage = "audit_findings_insert",
-            elapsed_ms = duration_ms(findings_insert_started),
-            "audit findings persisted"
-        );
-
-        let commit_started = Instant::now();
-        tracing::info!(
-            request_id = %record.request_id,
-            stage = "audit_transaction_commit",
-            "audit transaction commit attempt"
-        );
-        transaction.commit().map_err(|source| {
-            tracing::error!(
-                request_id = %record.request_id,
-                stage = "audit_transaction_commit",
-                elapsed_ms = duration_ms(commit_started),
-                transaction_elapsed_ms = duration_ms(transaction_started),
-                error = %source,
-                "audit transaction commit failed"
-            );
-            StoreError::Commit {
-                request_id: record.request_id.clone(),
-                source,
-            }
-        })?;
-        tracing::info!(
-            request_id = %record.request_id,
-            stage = "audit_transaction_commit",
-            elapsed_ms = duration_ms(commit_started),
-            transaction_elapsed_ms = duration_ms(transaction_started),
-            "audit transaction committed"
-        );
-
-        Ok(())
+        match confirmation.await {
+            Ok(Ok(batch_seq)) => Ok(batch_seq),
+            Ok(Err(shared)) => Err(StoreError::Batch {
+                request_id,
+                source: shared,
+            }),
+            // The writer dropped the responder without answering: it panicked or exited between
+            // enqueue and commit, so the commit state cannot safely be claimed either way.
+            Err(_) => Err(StoreError::WriterResponseLost { request_id }),
+        }
     }
 
     /// Executes a capped newest-first keyset query without selecting content columns.
@@ -506,24 +430,6 @@ impl Store {
         )?;
         record_from_raw(raw, findings, self.max_cell_bytes).map(Some)
     }
-
-    /// Obtains the only write connection and records poisoned ownership at the failed boundary.
-    fn lock_writer(
-        &self,
-        request_id: &str,
-        wait_started: Instant,
-    ) -> Result<MutexGuard<'_, Connection>, StoreError> {
-        self.writer.lock().map_err(|_| {
-            tracing::error!(
-                request_id,
-                stage = "audit_writer_lock",
-                writer_wait_elapsed_ms = duration_ms(wait_started),
-                error = "audit writer mutex is poisoned",
-                "audit writer lock failed"
-            );
-            StoreError::WriterUnavailable
-        })
-    }
 }
 
 impl Cursor {
@@ -553,6 +459,180 @@ impl Cursor {
     }
 }
 
+/// Runs the dedicated audit-writer thread: the sole runtime write path. It drains queued
+/// assessments into batched transactions so concurrent requests share one commit fsync, and
+/// answers every waiter only after its batch's durable commit. The loop ends when every queue
+/// sender has dropped and the queue is drained, which is the graceful-shutdown path.
+fn run_audit_writer(mut connection: Connection, mut queue: mpsc::Receiver<PersistRequest>) {
+    let mut batch: Vec<PersistRequest> = Vec::with_capacity(MAX_PERSIST_BATCH);
+    let mut batch_seq: u64 = 0;
+    while let Some(first) = queue.blocking_recv() {
+        batch.push(first);
+        // Natural batching: take whatever accumulated while the previous transaction ran,
+        // without waiting for more. An idle service commits batches of one and adds no latency;
+        // a saturated one amortizes each fsync across everything that queued behind it.
+        while batch.len() < MAX_PERSIST_BATCH {
+            match queue.try_recv() {
+                Ok(request) => batch.push(request),
+                // Empty or disconnected: either way, commit what is already held.
+                Err(_) => break,
+            }
+        }
+        batch_seq += 1;
+        commit_batch(&mut connection, batch_seq, &mut batch);
+    }
+    tracing::info!(
+        stage = "audit_writer_exit",
+        batches_committed = batch_seq,
+        "audit writer queue closed and drained; writer thread exiting"
+    );
+}
+
+/// Commits one batch atomically and answers every member's waiter with the durable outcome.
+/// On any error the whole batch rolls back and every member receives the shared cause;
+/// nothing is ever claimed partially committed.
+fn commit_batch(connection: &mut Connection, batch_seq: u64, batch: &mut Vec<PersistRequest>) {
+    let batch_size = batch.len();
+    match execute_batch_transaction(connection, batch_seq, batch) {
+        Ok(timings) => {
+            // One consolidated success record per batch carries every phase duration. Each
+            // member's request-keyed durable evidence is its handler's terminal record, which
+            // cites this batch_seq after confirmation; per-member success lines here would
+            // reserialize the log writer per request and defeat the batching.
+            tracing::info!(
+                batch_seq,
+                batch_size,
+                begin_elapsed_ms = timings.begin_ms,
+                inserts_elapsed_ms = timings.inserts_ms,
+                commit_elapsed_ms = timings.commit_ms,
+                transaction_elapsed_ms = timings.transaction_ms,
+                "audit batch committed"
+            );
+            for request in batch.drain(..) {
+                if request.responder.send(Ok(batch_seq)).is_err() {
+                    // The record is durable; only the waiting handler is gone (cancelled), so
+                    // its terminal record will never cite the batch. Record it here instead.
+                    tracing::info!(
+                        request_id = %request.record.request_id,
+                        stage = "audit_commit_notify",
+                        batch_seq,
+                        "assessment committed but its verdict waiter had gone"
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            let shared = Arc::new(error);
+            tracing::error!(
+                batch_seq,
+                batch_size,
+                error = %shared,
+                "audit batch persistence failed; every member fails with this cause"
+            );
+            // Error paths stay per-request: each member's failure record carries its own
+            // identifiers and queue wait, per the diagnostics policy.
+            for request in batch.drain(..) {
+                tracing::error!(
+                    request_id = %request.record.request_id,
+                    stage = "audit_batch_member_failed",
+                    batch_seq,
+                    queue_wait_elapsed_ms = duration_ms(request.enqueued),
+                    error = %shared,
+                    "assessment persistence failed with its batch"
+                );
+                let _ = request.responder.send(Err(Arc::clone(&shared)));
+            }
+        }
+    }
+}
+
+/// Carries the per-phase durations of one committed batch for the consolidated success record.
+struct BatchTimings {
+    begin_ms: f64,
+    inserts_ms: f64,
+    commit_ms: f64,
+    transaction_ms: f64,
+}
+
+/// Executes every member's inserts and the shared commit inside one transaction. Errors keep
+/// each member's local context (request id, rule id); logging belongs to the caller.
+fn execute_batch_transaction(
+    connection: &mut Connection,
+    batch_seq: u64,
+    batch: &[PersistRequest],
+) -> Result<BatchTimings, StoreError> {
+    let transaction_started = Instant::now();
+    let begin_started = Instant::now();
+    let transaction = connection
+        .transaction()
+        .map_err(|source| StoreError::Begin { batch_seq, source })?;
+    let begin_ms = duration_ms(begin_started);
+
+    let inserts_started = Instant::now();
+    for request in batch {
+        let record = &request.record;
+        let elapsed_ms = i64_from_u64(record.elapsed_ms, "elapsed_ms")?;
+        // `prepare_cached` keeps SQL compilation out of the writer's serialized path: the sole
+        // writer connection caches both insert statements permanently. The `CachedStatement`
+        // drops back into the cache at the end of each `and_then`, leaving no borrow to
+        // conflict with `commit()`; re-fetching per record is a cache hit and keeps prepare
+        // failures mapped with the same per-record error context.
+        transaction
+            .prepare_cached(INSERT_ASSESSMENT_SQL)
+            .and_then(|mut statement| {
+                statement.execute(params![
+                    record.request_id,
+                    record.created_at_ms,
+                    verdict_name(record.verdict),
+                    record.content_sha256,
+                    record.content,
+                    record.sanitized_sha256.as_deref(),
+                    record.sanitized_content.as_deref(),
+                    record.ruleset_version,
+                    elapsed_ms,
+                ])
+            })
+            .map_err(|source| StoreError::WriteAssessment {
+                request_id: record.request_id.clone(),
+                source,
+            })?;
+        for finding in &record.findings {
+            let span_start = i64_from_usize(finding.span.start, "span_start")?;
+            let span_end = i64_from_usize(finding.span.end, "span_end")?;
+            transaction
+                .prepare_cached(INSERT_FINDING_SQL)
+                .and_then(|mut statement| {
+                    statement.execute(params![
+                        record.request_id,
+                        finding.rule_id,
+                        severity_name(finding.severity),
+                        span_start,
+                        span_end,
+                    ])
+                })
+                .map_err(|source| StoreError::WriteFinding {
+                    request_id: record.request_id.clone(),
+                    rule_id: finding.rule_id.clone(),
+                    source,
+                })?;
+        }
+    }
+    let inserts_ms = duration_ms(inserts_started);
+
+    let commit_started = Instant::now();
+    transaction.commit().map_err(|source| StoreError::Commit {
+        batch_seq,
+        batch_size: batch.len(),
+        source,
+    })?;
+    Ok(BatchTimings {
+        begin_ms,
+        inserts_ms,
+        commit_ms: duration_ms(commit_started),
+        transaction_ms: duration_ms(transaction_started),
+    })
+}
+
 /// Configures the single write role without granting schema-creation behavior.
 fn configure_writer(
     connection: &Connection,
@@ -562,11 +642,36 @@ fn configure_writer(
     connection
         .busy_timeout(busy_timeout)
         .and_then(|()| connection.pragma_update(None, "foreign_keys", true))
+        // FULL is the deliberate durability decision for the audit writer: in WAL mode it costs
+        // one WAL fsync per commit and guarantees a returned verdict's audit row survives power
+        // loss. Set explicitly so the decision is visible rather than inherited from SQLite
+        // defaults; relaxing to NORMAL is an operator-approved change, not a tuning knob.
+        .and_then(|()| connection.pragma_update(None, "synchronous", "FULL"))
         .map_err(|source| StoreError::Configure {
             path: path.to_path_buf(),
             role: "writer",
             source,
         })
+}
+
+/// Confirms the persistent WAL journal mode that initialization establishes; the runtime
+/// verifies this database-file property and never sets it (migration rule).
+fn verify_journal_mode(connection: &Connection, path: &Path) -> Result<(), StoreError> {
+    let journal_mode = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+        .map_err(|source| StoreError::Schema {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        return Err(StoreError::SchemaMismatch {
+            path: path.to_path_buf(),
+            detail: format!(
+                "journal mode is '{journal_mode}' but 'wal' is required; initialize a new database with the init command, or apply the deliberate WAL migration step to an existing database"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Opens an isolated read-only role and applies query-only plus wall-clock enforcement.
@@ -981,9 +1086,20 @@ fn usize_from_i64(value: i64, field: &'static str) -> Result<usize, StoreError> 
     })
 }
 
-/// Converts monotonic storage-boundary durations into bounded diagnostic milliseconds.
-fn duration_ms(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+/// Converts monotonic storage-boundary durations into fractional diagnostic milliseconds at
+/// microsecond resolution, because the writer's serialized phases complete in well under 1 ms
+/// and integer milliseconds floor them to zero.
+fn duration_ms(started: Instant) -> f64 {
+    (started.elapsed().as_secs_f64() * 1_000_000.0).round() / 1000.0
+}
+
+impl StoreError {
+    /// True when the commit outcome cannot safely be claimed either way — the writer died
+    /// between enqueue and confirmation — so callers must report unknown status rather than a
+    /// definite persistence failure.
+    pub fn commit_state_unknown(&self) -> bool {
+        matches!(self, Self::WriterResponseLost { .. })
+    }
 }
 
 impl fmt::Display for StoreError {
@@ -1029,10 +1145,22 @@ impl fmt::Display for StoreError {
             Self::InvalidStoredValue { field, detail } => {
                 write!(formatter, "invalid audit field {field}: {detail}")
             }
-            Self::WriterUnavailable => write!(formatter, "audit writer mutex is poisoned"),
-            Self::Begin { request_id, source } => write!(
+            Self::WriterUnavailable => write!(formatter, "audit writer queue is closed"),
+            Self::WriterSpawn { source } => write!(
                 formatter,
-                "failed to begin audit transaction for request {request_id}: {source}"
+                "failed to spawn the audit writer thread: {source}"
+            ),
+            Self::WriterResponseLost { request_id } => write!(
+                formatter,
+                "audit commit confirmation was lost for request {request_id}; commit state is unknown"
+            ),
+            Self::Batch { request_id, source } => write!(
+                formatter,
+                "audit batch persistence failed for request {request_id}: {source}"
+            ),
+            Self::Begin { batch_seq, source } => write!(
+                formatter,
+                "failed to begin audit transaction for batch {batch_seq}: {source}"
             ),
             Self::WriteAssessment { request_id, source } => write!(
                 formatter,
@@ -1046,9 +1174,13 @@ impl fmt::Display for StoreError {
                 formatter,
                 "failed to persist finding {rule_id} for request {request_id}: {source}"
             ),
-            Self::Commit { request_id, source } => write!(
+            Self::Commit {
+                batch_seq,
+                batch_size,
+                source,
+            } => write!(
                 formatter,
-                "failed to commit audit transaction for request {request_id}: {source}"
+                "failed to commit audit transaction for batch {batch_seq} of {batch_size} assessments: {source}"
             ),
             Self::Query { operation, source } => {
                 write!(formatter, "failed to {operation}: {source}")
@@ -1069,12 +1201,15 @@ impl Error for StoreError {
             | Self::WriteFinding { source, .. }
             | Self::Commit { source, .. }
             | Self::Query { source, .. } => Some(source),
+            Self::WriterSpawn { source } => Some(source),
+            Self::Batch { source, .. } => Some(source.as_ref()),
             Self::SchemaMismatch { .. }
             | Self::InvalidLimit { .. }
             | Self::TooManyFindings { .. }
             | Self::CellTooLarge { .. }
             | Self::InvalidStoredValue { .. }
-            | Self::WriterUnavailable => None,
+            | Self::WriterUnavailable
+            | Self::WriterResponseLost { .. } => None,
         }
     }
 }

@@ -53,13 +53,11 @@ pub(crate) async fn assess(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<AssessResponse>, ApiError> {
-    let request_id = Uuid::new_v4().to_string();
+    // Time-ordered v7 (not random v4): request_id is the audit primary key, so ordered ids keep
+    // its index inserts on the hot B-tree edge instead of dirtying a random page per request.
+    // The embedded timestamp reveals nothing the response's created_at does not already expose.
+    let request_id = Uuid::now_v7().to_string();
     let operation_started = Instant::now();
-    tracing::info!(
-        request_id = %request_id,
-        stage = "assessment_start",
-        "assessment operation started"
-    );
 
     let created_at_ms = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => match i64::try_from(duration.as_millis()) {
@@ -168,6 +166,8 @@ pub(crate) async fn assess(
         ));
     }
 
+    // Sole success-path record before pipeline dispatch: an accepted request whose pipeline
+    // completion record never appears was lost in permit wait or pipeline execution.
     tracing::info!(
         request_id = %request_id,
         stage = "assessment_validation",
@@ -178,13 +178,6 @@ pub(crate) async fn assess(
     );
 
     let pipeline_wait_started = Instant::now();
-    tracing::info!(
-        request_id = %request_id,
-        stage = "assessment_pipeline_dispatch",
-        ruleset_version = %state.ruleset.version,
-        pipeline_parallelism = state.pipeline_parallelism,
-        "assessment pipeline permit wait started"
-    );
     let permit = match Arc::clone(&state.pipeline_permits).acquire_owned().await {
         Ok(permit) => permit,
         Err(error) => {
@@ -206,13 +199,6 @@ pub(crate) async fn assess(
         }
     };
     let pipeline_wait_ms = duration_ms(pipeline_wait_started);
-    tracing::info!(
-        request_id = %request_id,
-        stage = "assessment_pipeline_dispatch",
-        pipeline_parallelism = state.pipeline_parallelism,
-        wait_elapsed_ms = pipeline_wait_ms,
-        "assessment pipeline permit acquired"
-    );
 
     let pipeline_task_started = Instant::now();
     let pipeline_state = Arc::clone(&state);
@@ -220,24 +206,35 @@ pub(crate) async fn assess(
     let pipeline_task_request_id = request_id.clone();
     let content = payload.content;
     // The owned permit stays inside the non-cancellable closure so dropping the HTTP future cannot
-    // advertise CPU capacity while classification is still running. Completion is logged inside
+    // advertise CPU capacity while classification is still running. The consolidated pipeline
+    // record — permit wait, task and execution timing, and the findings summary — is logged inside
     // that closure so handler cancellation cannot erase the spawned task's terminal evidence.
     // Returning the owned content avoids cloning it before the later audit-persistence boundary.
-    let (content, outcome, pipeline_execution_ms) = match tokio::task::spawn_blocking(move || {
+    let (content, outcome) = match tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let execution_started = Instant::now();
         let outcome = pipeline::assess(&content, &pipeline_state.ruleset);
         let execution_elapsed_ms = duration_ms(execution_started);
+        let finding_counts = finding_counts(&outcome.findings);
+        let rule_ids = unique_rule_ids(&outcome.findings);
         tracing::info!(
             request_id = %pipeline_task_request_id,
-            stage = "assessment_pipeline_dispatch",
+            stage = "assessment_pipeline",
+            verdict = verdict_name(outcome.verdict),
+            critical_findings = finding_counts.critical,
+            suspect_findings = finding_counts.suspect,
+            advisory_findings = finding_counts.advisory,
+            rule_ids = ?rule_ids,
+            redaction_span_count = outcome.redaction_span_count,
+            rescan_clean = outcome.rescan_clean,
+            ruleset_version = %pipeline_state.ruleset.version,
             pipeline_parallelism = pipeline_state.pipeline_parallelism,
             wait_elapsed_ms = pipeline_wait_ms,
             task_elapsed_ms = duration_ms(pipeline_task_started),
             execution_elapsed_ms,
-            "assessment pipeline task completed"
+            "assessment pipeline completed"
         );
-        (content, outcome, execution_elapsed_ms)
+        (content, outcome)
     })
     .await
     {
@@ -263,22 +260,6 @@ pub(crate) async fn assess(
             ));
         }
     };
-    let finding_counts = finding_counts(&outcome.findings);
-    let rule_ids = unique_rule_ids(&outcome.findings);
-    tracing::info!(
-        request_id = %request_id,
-        stage = "assessment_pipeline",
-        verdict = verdict_name(outcome.verdict),
-        critical_findings = finding_counts.critical,
-        suspect_findings = finding_counts.suspect,
-        advisory_findings = finding_counts.advisory,
-        rule_ids = ?rule_ids,
-        redaction_span_count = outcome.redaction_span_count,
-        rescan_clean = outcome.rescan_clean,
-        elapsed_ms = pipeline_execution_ms,
-        "assessment pipeline completed"
-    );
-
     let (sanitized_content, sanitized_sha256) = match outcome.sanitized {
         Some(sanitized) => (Some(sanitized.content), Some(sanitized.sha256)),
         None => (None, None),
@@ -292,30 +273,39 @@ pub(crate) async fn assess(
         sanitized_sha256,
         sanitized_content,
         ruleset_version: state.ruleset.version.clone(),
-        elapsed_ms: duration_ms(operation_started),
+        elapsed_ms: duration_ms_whole(operation_started),
         findings: outcome.findings,
     };
 
     let persistence_started = Instant::now();
-    tracing::info!(
-        request_id = %record.request_id,
-        stage = "assessment_audit_persistence",
-        "assessment audit persistence boundary started"
-    );
-    // Keep the operation identity outside the moved task so panic or cancellation responses still
-    // satisfy the protocol requirement that every authenticated assessment error carries it.
+    // Keep the operation identity so every terminal error response still satisfies the protocol
+    // requirement that authenticated assessment errors carry it.
     let persistence_request_id = record.request_id.clone();
-    let persistence_state = Arc::clone(&state);
-    let record = match tokio::task::spawn_blocking(move || {
-        persistence_state
-            .store
-            .persist_assessment(&record)
-            .map(|()| record)
-    })
-    .await
-    {
-        Ok(Ok(record)) => record,
-        Ok(Err(error)) => {
+    // The audit-writer thread consumes the record; the caller response is shaped from this
+    // clone. Its cost is bounded by the content limit and is far below the persistence budget.
+    let response_record = record.clone();
+    // Awaiting the store's confirmation is the persistence boundary: enqueue, batch commit on
+    // the dedicated writer thread, then durable-outcome delivery. The verdict below is not
+    // released until that confirmation arrives.
+    let audit_batch_seq = match state.store.persist_assessment(record).await {
+        Ok(batch_seq) => batch_seq,
+        Err(error) if error.commit_state_unknown() => {
+            tracing::error!(
+                request_id = %persistence_request_id,
+                stage = "assessment_audit_persistence",
+                reason = AUDIT_STATUS_UNKNOWN,
+                elapsed_ms = duration_ms(persistence_started),
+                operation_elapsed_ms = duration_ms(operation_started),
+                error = %error,
+                "assessment terminal error ready"
+            );
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AUDIT_STATUS_UNKNOWN,
+                Some(persistence_request_id.clone()),
+            ));
+        }
+        Err(error) => {
             tracing::error!(
                 request_id = %persistence_request_id,
                 stage = "assessment_audit_persistence",
@@ -331,40 +321,20 @@ pub(crate) async fn assess(
                 Some(persistence_request_id.clone()),
             ));
         }
-        Err(error) => {
-            tracing::error!(
-                request_id = %persistence_request_id,
-                stage = "assessment_audit_persistence",
-                reason = AUDIT_STATUS_UNKNOWN,
-                task_cancelled = error.is_cancelled(),
-                task_panicked = error.is_panic(),
-                elapsed_ms = duration_ms(persistence_started),
-                operation_elapsed_ms = duration_ms(operation_started),
-                error = %error,
-                "assessment terminal error ready"
-            );
-            return Err(ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                AUDIT_STATUS_UNKNOWN,
-                Some(persistence_request_id.clone()),
-            ));
-        }
     };
-    tracing::info!(
-        request_id = %record.request_id,
-        stage = "assessment_audit_persistence",
-        elapsed_ms = duration_ms(persistence_started),
-        "assessment audit persistence confirmed"
-    );
+    // Handler-side persistence duration spans queue wait plus the shared batch commit; the
+    // store's consolidated batch record carries the transaction-phase breakdown for the cited
+    // batch, and this terminal record is the request-keyed half of that evidence.
+    let persistence_elapsed_ms = duration_ms(persistence_started);
 
     let response = AssessResponse {
-        request_id: record.request_id,
-        verdict: record.verdict,
-        content_sha256: record.content_sha256,
-        sanitized_content: record.sanitized_content,
-        sanitized_sha256: record.sanitized_sha256,
-        findings: record.findings,
-        ruleset_version: record.ruleset_version,
+        request_id: response_record.request_id,
+        verdict: response_record.verdict,
+        content_sha256: response_record.content_sha256,
+        sanitized_content: response_record.sanitized_content,
+        sanitized_sha256: response_record.sanitized_sha256,
+        findings: response_record.findings,
+        ruleset_version: response_record.ruleset_version,
     };
     let operation_elapsed_ms = duration_ms(operation_started);
     let verdict = verdict_name(response.verdict);
@@ -374,6 +344,8 @@ pub(crate) async fn assess(
         status = StatusCode::OK.as_u16(),
         verdict,
         socket_delivery = "unknown_after_transport_handoff",
+        audit_batch_seq,
+        persistence_elapsed_ms,
         elapsed_ms = operation_elapsed_ms,
         "assessment result ready and handed to the HTTP transport"
     );
@@ -459,7 +431,14 @@ fn verdict_name(verdict: Verdict) -> &'static str {
     }
 }
 
-/// Converts monotonic operation durations into the bounded millisecond diagnostic field.
-fn duration_ms(started: Instant) -> u64 {
+/// Converts monotonic operation durations into fractional diagnostic milliseconds at
+/// microsecond resolution; sub-millisecond hot-path phases floor to zero in integer units.
+fn duration_ms(started: Instant) -> f64 {
+    (started.elapsed().as_secs_f64() * 1_000_000.0).round() / 1000.0
+}
+
+/// Converts the total operation duration into the whole-millisecond form persisted in the
+/// audit record's integer `elapsed_ms` column; diagnostics use `duration_ms` instead.
+fn duration_ms_whole(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }

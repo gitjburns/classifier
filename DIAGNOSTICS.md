@@ -51,6 +51,16 @@ Helper functions may return typed errors without logging when their caller owns
 the diagnostic boundary. Boundary-owning functions must log or wrap failures
 with the local facts known at that boundary.
 
+On a measured high-frequency success path, a boundary's start and intermediate
+success records may be consolidated into a single boundary-completion record,
+provided that record carries every fact and per-phase elapsed duration the
+separate records carried, and every error path keeps its full immediate local
+context. Consolidation trades crash- and hang-window attribution for hot-path
+throughput: a request that completes remains fully attributable from its
+completion records, while one that never completes a phase is narrowed only to
+the span between its last completed record and the next expected one.
+Consolidation never applies to error paths.
+
 ## Required Lifecycle Coverage
 
 Startup must log each applicable boundary among mode, bind address, config path
@@ -66,12 +76,25 @@ available.
 Every operation must log accepted, validation failure when applicable, each
 meaningful stage start and success/checkpoint, terminal result ready, terminal
 error ready, terminal delivery success or failure, operation task finish, and
-panic or cancellation when detectable.
+panic or cancellation when detectable. On a consolidated success path (see the
+Boundary Rule), stage starts and intermediate successes may merge into
+completion records carrying the same facts and per-stage elapsed durations.
 
 Every storage transaction must log begin attempt, begin success or failure,
 each persistence phase, each phase failure with local identifiers, commit
 attempt, commit success or failure, rollback or abort when directly visible,
-and post-commit publish start/success/failure when applicable.
+and post-commit publish start/success/failure when applicable. On a
+consolidated success path, one post-commit record carrying each phase's
+elapsed duration satisfies the success-path requirements; every failure record
+remains mandatory.
+
+A writer that batches multiple operations into one transaction may satisfy the
+success-path requirements with one consolidated post-commit record per batch,
+carrying the batch identifier, batch size, and every per-phase elapsed
+duration, provided each member operation's own lifecycle records cite the
+batch identifier after durable confirmation. A batch failure requires one
+record per member with that member's local identifiers and the shared cause;
+batch-level failure records supplement, never replace, them.
 
 Every model call and startup smoke check must log model role, call purpose,
 start, success, normal error, elapsed milliseconds, compact input shape facts,

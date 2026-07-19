@@ -28,6 +28,22 @@ enum InitDbError {
     AlreadyInitialized {
         path: PathBuf,
     },
+    JournalMode {
+        path: PathBuf,
+        source: rusqlite::Error,
+    },
+    JournalModeUnexpected {
+        path: PathBuf,
+        mode: String,
+    },
+    PageSize {
+        path: PathBuf,
+        source: rusqlite::Error,
+    },
+    PageSizeUnexpected {
+        path: PathBuf,
+        size: i64,
+    },
     Begin {
         path: PathBuf,
         source: rusqlite::Error,
@@ -89,6 +105,52 @@ fn initialize_database(path: &Path) -> Result<(), InitDbError> {
         });
     }
 
+    // 4 KiB pages, declared explicitly: measurement showed smaller pages defeat the batched
+    // audit writer (batch members stop sharing hot pages, so nothing dedups per commit) and
+    // multiply the overflow-page count of large content rows. The page is the unit of write
+    // coalescing, not just of random-touch waste. The size must be declared before the first
+    // write below — entering WAL mode writes the database header and fixes it permanently.
+    let requested_page_size: i64 = 4096;
+    connection
+        .pragma_update(None, "page_size", requested_page_size)
+        .map_err(|source| InitDbError::PageSize {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+    // WAL is a persistent database-file property; the service runtime verifies it but never sets
+    // it, so it must be established here. It is set before the schema transaction deliberately:
+    // a crash after this point leaves an empty WAL-mode database that a rerun initializes
+    // normally, while the reverse order could strand an initialized DELETE-mode database that
+    // this command then refuses to touch.
+    let journal_mode = connection
+        .pragma_update_and_check(None, "journal_mode", "wal", |row| row.get::<_, String>(0))
+        .map_err(|source| InitDbError::JournalMode {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        return Err(InitDbError::JournalModeUnexpected {
+            path: path.to_path_buf(),
+            mode: journal_mode,
+        });
+    }
+
+    // The WAL switch above wrote the header, so the declared page size is now fixed; confirm the
+    // file actually adopted it rather than silently keeping a default.
+    let page_size = connection
+        .query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))
+        .map_err(|source| InitDbError::PageSize {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if page_size != requested_page_size {
+        return Err(InitDbError::PageSizeUnexpected {
+            path: path.to_path_buf(),
+            size: page_size,
+        });
+    }
+
     // DDL is atomic: a partial schema must never be mistaken for an initialized store.
     let transaction = connection
         .transaction()
@@ -132,6 +194,26 @@ impl fmt::Display for InitDbError {
                 "database {} already contains the assessments table; refusing to modify it",
                 path.display()
             ),
+            Self::JournalMode { path, source } => write!(
+                formatter,
+                "failed to set WAL journal mode on {}: {source}",
+                path.display()
+            ),
+            Self::JournalModeUnexpected { path, mode } => write!(
+                formatter,
+                "database {} reported journal mode '{mode}' after requesting 'wal'",
+                path.display()
+            ),
+            Self::PageSize { path, source } => write!(
+                formatter,
+                "failed to set the page size on {}: {source}",
+                path.display()
+            ),
+            Self::PageSizeUnexpected { path, size } => write!(
+                formatter,
+                "database {} reported page size {size} after requesting 4096",
+                path.display()
+            ),
             Self::Begin { path, source } => write!(
                 formatter,
                 "failed to begin schema transaction for {}: {source}",
@@ -158,10 +240,14 @@ impl Error for InitDbError {
             Self::Config(source) => Some(source),
             Self::Open { source, .. }
             | Self::Inspect { source, .. }
+            | Self::JournalMode { source, .. }
+            | Self::PageSize { source, .. }
             | Self::Begin { source, .. }
             | Self::Apply { source, .. }
             | Self::Commit { source, .. } => Some(source),
-            Self::AlreadyInitialized { .. } => None,
+            Self::AlreadyInitialized { .. }
+            | Self::JournalModeUnexpected { .. }
+            | Self::PageSizeUnexpected { .. } => None,
         }
     }
 }
